@@ -46,7 +46,9 @@ d3d9_src = [
   'd3d9_window.cpp',
   'd3d9_interop.cpp',
   'd3d9_on_12.cpp',
-  'd3d9_bridge.cpp'
+  'd3d9_bridge.cpp',
+  '../tf2vr/HMDInterface.cpp',
+  '../tf2vr/OpenXRDirectMode.cpp',
 ]
 
 d3d9_ld_args      = []
@@ -57,12 +59,27 @@ if platform != 'windows'
   d3d9_link_depends += files('d3d9.sym')
 endif
 
+openxr_sdk = get_option('openxr_sdk')
+vulkan_sdk = get_option('vulkan_sdk')
+
+openxr_include_dir = include_directories('../../include/openxr')
+openxr_lib_dir = join_paths(openxr_sdk, 'src', 'loader', 'Release')
+
+openxr_dep = declare_dependency(
+  include_directories: openxr_include_dir,
+  dependencies: meson.get_compiler('cpp').find_library('openxr_loader', dirs: [openxr_lib_dir]))
+
+vulkan_lib_dir = join_paths(vulkan_sdk, 'Lib')
+vulkan_dep = declare_dependency(
+  include_directories: dxvk_include_path,
+  dependencies: meson.get_compiler('cpp').find_library('vulkan-1', dirs: [vulkan_lib_dir]))
+
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
-  dependencies        : [ dxso_dep, dxvk_dep ],
+  dependencies        : [ dxso_dep, dxvk_dep, openxr_dep, vulkan_dep ],
   include_directories : dxvk_include_path,
-  install             : true,
+  install             : false,
   vs_module_defs      : 'd3d9'+def_spec_ext,
-  link_args           : d3d9_ld_args,
+  link_args           : d3d9_ld_args + ['-Wl,--kill-at,--demangle,--out-implib,d3d9.lib'],
   link_depends        : [ d3d9_link_depends ],
   kwargs              : dxvk_so_version,
 )

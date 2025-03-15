@@ -6,7 +6,6 @@
 
 #include "../spirv/spirv_module.h"
 
-class D3D9DeviceEx;
 
 namespace dxvk {
 

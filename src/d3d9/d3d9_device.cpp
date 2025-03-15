@@ -25,11 +25,17 @@
 
 #include "d3d9_initializer.h"
 
+#include "VkSubmitThreadCallback.h"
+#include "../tf2vr/HMDInterface.h"
+
 #include <algorithm>
 #include <cfloat>
 #ifdef MSC_VER
 #pragma fenv_access (on)
 #endif
+
+VkSubmitThreadCallback *g_pVkSubmitThreadCallback = nullptr;
+HMDInterface* hmdInterface = nullptr;
 
 namespace dxvk {
 
@@ -195,6 +201,12 @@ namespace dxvk {
     m_activeRTsWhichAreTextures = 0;
     m_alphaSwizzleRTs = 0;
     m_lastHazardsRT = 0;
+
+    dxvk::Logger::info("OpenXR: Preparing HMDInterface");
+
+    hmdInterface = HMDInterface::Get();
+    dxvk::Logger::info("HMDInterface created!");
+	  g_pVkSubmitThreadCallback = hmdInterface->GetVkSubmitThreadCallback();
   }
 
 
@@ -1702,6 +1714,10 @@ namespace dxvk {
         m_flags.clr(D3D9DeviceFlag::ValidSampleMask);
         m_flags.set(D3D9DeviceFlag::DirtyMultiSampleState);
       }
+    }
+
+    if (rt != nullptr) {
+      hmdInterface->OnRenderTargetChanged(GetDXVKDevice(), rt);
     }
 
     return D3D_OK;
@@ -4069,6 +4085,8 @@ namespace dxvk {
     const RGNDATA* pDirtyRegion,
           DWORD dwFlags) {
 
+            
+
     if (m_cursor.IsSoftwareCursor()) {
       D3D9_SOFTWARE_CURSOR* pSoftwareCursor = m_cursor.GetSoftwareCursor();
 
@@ -4091,12 +4109,18 @@ namespace dxvk {
       }
     }
 
-    return m_implicitSwapchain->Present(
+    hmdInterface->PrePresent(this);
+
+    HRESULT result =  m_implicitSwapchain->Present(
       pSourceRect,
       pDestRect,
       hDestWindowOverride,
       pDirtyRegion,
       dwFlags);
+
+    hmdInterface->PostPresent();
+
+    return result;
   }
 
 

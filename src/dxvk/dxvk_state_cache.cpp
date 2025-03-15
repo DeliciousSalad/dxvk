@@ -896,7 +896,7 @@ namespace dxvk {
 
 
   std::string DxvkStateCache::getCacheDir() const {
-    return env::getEnvVar("DXVK_STATE_CACHE_PATH");
+    return env::getEnvVar("TFVR_STATE_CACHE_PATH");
   }
 
 }

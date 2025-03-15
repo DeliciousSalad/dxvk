@@ -1,0 +1,9 @@
+install_headers(
+  'openxr.h',
+  'openxr_loader_negotiation.h',
+  'openxr_platform.h',
+  'openxr_platform_defines.h',
+  'openxr_reflection.h',
+  'openxr_reflection_parent_structs.h',
+  'openxr_reflection_structs.h'
+)
