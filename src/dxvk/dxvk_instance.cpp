@@ -54,6 +54,46 @@ namespace dxvk {
     createInstanceLoader(args, flags);
     m_adapters = this->queryAdapters();
 
+    // Check if all required extensions are actually supported by the physical device
+    if (!m_adapters.empty()) {
+      VkPhysicalDevice physicalDevice = m_adapters[0]->handle();
+      VkPhysicalDeviceProperties deviceProps;
+      m_vki->vkGetPhysicalDeviceProperties(physicalDevice, &deviceProps);
+      Logger::info("Using physical device: " + std::string(deviceProps.deviceName) + 
+                  " (API version: " + std::to_string(VK_VERSION_MAJOR(deviceProps.apiVersion)) + "." +
+                  std::to_string(VK_VERSION_MINOR(deviceProps.apiVersion)) + "." +
+                  std::to_string(VK_VERSION_PATCH(deviceProps.apiVersion)) + ")");
+
+      // Enumerate supported extensions
+      uint32_t extCount = 0;
+      m_vki->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
+      std::vector<VkExtensionProperties> supportedExts(extCount);
+      m_vki->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, supportedExts.data());
+
+      // Check if all required extensions are supported
+      std::vector<std::string> requiredExts = {
+          "VK_KHR_external_memory",
+          "VK_KHR_external_semaphore",
+          "VK_KHR_dedicated_allocation",
+          "VK_KHR_get_memory_requirements2",
+          "VK_KHR_external_memory_win32",
+          "VK_KHR_win32_keyed_mutex"
+          // VK_EXT_debug_marker is optional and not supported on this device
+      };
+
+      Logger::info("Checking if required extensions are supported:");
+      for (const auto& reqExt : requiredExts) {
+          bool found = false;
+          for (const auto& ext : supportedExts) {
+              if (reqExt == ext.extensionName) {
+                  found = true;
+                  break;
+              }
+          }
+          Logger::info("  - " + reqExt + ": " + (found ? "SUPPORTED" : "NOT SUPPORTED"));
+      }
+    }
+
     for (const auto& provider : m_extProviders)
       provider->initDeviceExtensions(this);
 

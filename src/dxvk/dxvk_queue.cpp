@@ -1,6 +1,10 @@
 #include "dxvk_device.h"
 #include "dxvk_queue.h"
 
+#include "VkSubmitThreadCallback.h"
+
+extern VkSubmitThreadCallback *g_pVkSubmitThreadCallback;
+
 namespace dxvk {
   
   DxvkSubmissionQueue::DxvkSubmissionQueue(DxvkDevice* device, const DxvkQueueCallback& callback)
@@ -169,8 +173,22 @@ namespace dxvk {
           if (entry.latency.tracker)
             entry.latency.tracker->notifyQueuePresentBegin(entry.latency.frameId);
 
+
+          if (g_pVkSubmitThreadCallback != nullptr)
+			    {
+				    g_pVkSubmitThreadCallback->PrePresentCallBack();
+			    }
+
+
           entry.result = entry.present.presenter->presentImage(
             entry.present.frameId, entry.latency.tracker);
+
+
+          if (g_pVkSubmitThreadCallback != nullptr)
+          {
+            g_pVkSubmitThreadCallback->PostPresentCallback();
+          }
+
 
           if (entry.latency.tracker) {
             entry.latency.tracker->notifyQueuePresentEnd(

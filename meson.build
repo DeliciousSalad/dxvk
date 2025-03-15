@@ -144,7 +144,8 @@ else
   dxvk_include_dirs += [
     './include/native',
     './include/native/windows',
-    './include/native/directx'
+    './include/native/directx',
+	'./include/openxr'
   ]
 
   lib_sdl3 = dependency('SDL3', required: false)
