@@ -358,6 +358,13 @@ void OpenXRDirectMode::PrePresent(dxvk::D3D9DeviceEx *device)
 		return;
 	}
 
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: PrePresent skipped - compositor is active");
+		return;
+	}
+
 	m_lastUsedDevice = device;
 	m_bSubmitCalled = true;
 	Logger::info("OpenXRDirectMode: Pre-present phase");
@@ -367,6 +374,13 @@ void OpenXRDirectMode::PostPresent()
 {
 	// Called after d3d9 swapchain present
 	if (!m_session) {
+		return;
+	}
+
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: PostPresent skipped - compositor is active");
 		return;
 	}
 
@@ -381,6 +395,14 @@ void OpenXRDirectMode::PrePresentCallBack()
 	if (!m_session) {
 		return;
 	}
+
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: PrePresentCallback skipped - compositor is active");
+		return;
+	}
+
 	Logger::info("OpenXRDirectMode: PrePresentCallback called!");
 
 	auto& timing = m_frameTimings[m_currentTimingIndex];
@@ -396,6 +418,13 @@ void OpenXRDirectMode::PrePresentCallBack()
 void OpenXRDirectMode::PostPresentCallback() 
 {
 	if (!m_session) {
+		return;
+	}
+
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: PostPresentCallback skipped - compositor is active");
 		return;
 	}
 
@@ -422,6 +451,13 @@ bool OpenXRDirectMode::BeginFrame()
 	
 	if (!m_session) {
 		Logger::err("OpenXRDirectMode: Cannot begin frame - no active session");
+		return false;
+	}
+
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: BeginFrame skipped - compositor is active");
 		return false;
 	}
 
@@ -456,6 +492,13 @@ bool OpenXRDirectMode::EndFrame()
 	
 	if (!m_session) {
 		Logger::err("OpenXRDirectMode: Cannot end frame - no active session");
+		return false;
+	}
+
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: EndFrame skipped - compositor is active");
 		return false;
 	}
 
@@ -1163,8 +1206,43 @@ void OpenXRDirectMode::GetViews(XrView*& views, XrSpaceLocation& headLocation, u
 	viewCount = m_views.size();
 }
 
+void OpenXRDirectMode::GetViewsPublic(XrView* views, XrSpaceLocation& headLocation, uint32_t& viewCount)
+{
+	XrView* viewsPtr = views;
+	GetViews(viewsPtr, headLocation, viewCount);
+	// Copy the data since GetViews expects a reference to pointer
+	if (views && viewsPtr && viewCount <= 2) {
+		for (uint32_t i = 0; i < viewCount; ++i) {
+			views[i] = viewsPtr[i];
+		}
+	}
+}
+
+void OpenXRDirectMode::ResetFrameState()
+{
+	Logger::info("OpenXRDirectMode: Resetting frame state for compositor takeover");
+	
+	// Reset frame tracking flags
+	m_bFrameStarted = false;
+	m_bSubmitCalled = false;
+	
+	// Reset atomic frame running state
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_bFrameRunning.store(false, std::memory_order_release);
+		m_frameCompletionEvent.notify_all();
+	}
+}
+
 bool OpenXRDirectMode::WaitPoses()
 {
+	// Don't interfere with compositor's frame management
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive()) {
+		Logger::info("OpenXRDirectMode: WaitPoses skipped - compositor is active");
+		return true; // Return true to avoid breaking the main render loop
+	}
+
 	// Check if we already have a frame in progress
 	if (m_bFrameStarted) {
 		Logger::warn(str::format("OpenXRDirectMode: WaitPoses called when a frame is already in progress (frame ", m_frameCounter, ")"));
@@ -1394,6 +1472,815 @@ double OpenXRDirectMode::GetAverageTime(const std::vector<double>& times) const 
     }
     return sum / times.size();
 }
+
+// ============================================================================
+// VR Compositor State Management
+// ============================================================================
+
+// Source Engine State for VR Compositor
+enum SourceEngineState {
+    SOURCE_STATE_GAMEPLAY = 0,     // Normal game - Source handles VR
+    SOURCE_STATE_MENU = 1,         // Main menu - compositor takes over
+    SOURCE_STATE_LOADING = 2,      // Loading screen - compositor takes over
+    SOURCE_STATE_TRANSITION = 3    // Brief transitions
+};
+
+// ============================================================================
+// VR Compositor - Independent VR rendering for menus and loading screens
+// ============================================================================
+// 
+// This compositor runs on a separate thread with its own Vulkan device,
+// providing smooth VR frames during non-gameplay scenarios when Source's
+// normal rendering pipeline is not active or performing poorly.
+//
+class VRCompositor {
+private:
+    std::atomic<SourceEngineState> m_currentState{SOURCE_STATE_GAMEPLAY};
+    std::atomic<bool> m_compositorActive{false};
+    std::thread m_compositorThread;
+    std::mutex m_frameMutex;
+    std::atomic<bool> m_shouldStop{false};
+    
+    // OpenXR session access (shared with main DXVK)
+    OpenXRDirectMode* m_pOpenXRManager = nullptr;
+    
+    // Compositor's own OpenXR resources
+    XrSwapchain m_compositorSwapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    std::vector<XrSwapchainImageVulkanKHR> m_compositorSwapchainImages[2];
+    bool m_compositorSwapchainsCreated = false;
+    
+    // Compositor's own Vulkan resources (completely independent device)
+    VkDevice m_compositorDevice = VK_NULL_HANDLE;
+    VkQueue m_compositorQueue = VK_NULL_HANDLE;
+    uint32_t m_compositorQueueFamily = 0;
+    VkCommandPool m_compositorCommandPool = VK_NULL_HANDLE;
+    VkCommandBuffer m_compositorCommandBuffer = VK_NULL_HANDLE;
+    VkFence m_compositorFence = VK_NULL_HANDLE;
+    bool m_compositorVulkanResourcesCreated = false;
+    
+    // Frame submission data
+    struct FrameData {
+        void* textureHandle = nullptr;
+        int width = 0;
+        int height = 0;
+        bool hasNewFrame = false;
+    };
+    FrameData m_latestFrame;
+    
+public:
+    VRCompositor() = default;
+    ~VRCompositor() { 
+        Shutdown(); 
+        CleanupVulkanResources();
+    }
+    
+    void SetOpenXRManager(OpenXRDirectMode* manager) {
+        m_pOpenXRManager = manager;
+    }
+    
+    void CleanupVulkanResources() {
+        if (m_compositorDevice != VK_NULL_HANDLE) {
+            // Wait for device to be idle before cleanup
+            vkDeviceWaitIdle(m_compositorDevice);
+            
+            if (m_compositorFence != VK_NULL_HANDLE) {
+                vkDestroyFence(m_compositorDevice, m_compositorFence, nullptr);
+                m_compositorFence = VK_NULL_HANDLE;
+            }
+            
+            if (m_compositorCommandPool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(m_compositorDevice, m_compositorCommandPool, nullptr);
+                m_compositorCommandPool = VK_NULL_HANDLE;
+            }
+            
+            // Cleanup swapchains
+            for (int eye = 0; eye < 2; eye++) {
+                if (m_compositorSwapchains[eye] != XR_NULL_HANDLE) {
+                    xrDestroySwapchain(m_compositorSwapchains[eye]);
+                    m_compositorSwapchains[eye] = XR_NULL_HANDLE;
+                }
+            }
+            
+            vkDestroyDevice(m_compositorDevice, nullptr);
+            m_compositorDevice = VK_NULL_HANDLE;
+            m_compositorQueue = VK_NULL_HANDLE;
+            
+            dxvk::Logger::info("VR Compositor: Cleaned up independent Vulkan device");
+        }
+        m_compositorVulkanResourcesCreated = false;
+        m_compositorSwapchainsCreated = false;
+    }
+    
+    bool CreateCompositorSwapchains() {
+        if (!m_pOpenXRManager || m_compositorSwapchainsCreated) {
+            return m_compositorSwapchainsCreated;
+        }
+        
+        XrSession session = m_pOpenXRManager->GetSession();
+        if (session == XR_NULL_HANDLE) {
+            dxvk::Logger::warn("VR Compositor: Cannot create swapchains - no session");
+            return false;
+        }
+        
+        // Create swapchains for both eyes
+        for (int eye = 0; eye < 2; ++eye) {
+            XrSwapchainCreateInfo swapchainCreateInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+            swapchainCreateInfo.arraySize = 1;
+            swapchainCreateInfo.format = VK_FORMAT_R8G8B8A8_SRGB; // Use a common format
+            swapchainCreateInfo.width = m_pOpenXRManager->GetRenderWidth();
+            swapchainCreateInfo.height = m_pOpenXRManager->GetRenderHeight();
+            swapchainCreateInfo.mipCount = 1;
+            swapchainCreateInfo.faceCount = 1;
+            swapchainCreateInfo.sampleCount = 1;
+            swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+            
+            XrResult result = xrCreateSwapchain(session, &swapchainCreateInfo, &m_compositorSwapchains[eye]);
+            if (result != XR_SUCCESS) {
+                dxvk::Logger::err(str::format("VR Compositor: Failed to create swapchain for eye ", eye, " - error: ", static_cast<int>(result)));
+                return false;
+            }
+            
+            // Get swapchain images
+            uint32_t imageCount;
+            xrEnumerateSwapchainImages(m_compositorSwapchains[eye], 0, &imageCount, nullptr);
+            
+            m_compositorSwapchainImages[eye].resize(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR });
+            xrEnumerateSwapchainImages(m_compositorSwapchains[eye], imageCount, &imageCount, 
+                                     reinterpret_cast<XrSwapchainImageBaseHeader*>(m_compositorSwapchainImages[eye].data()));
+            
+            dxvk::Logger::info(str::format("VR Compositor: Created swapchain for eye ", eye, " with ", imageCount, " images"));
+        }
+        
+        m_compositorSwapchainsCreated = true;
+        dxvk::Logger::info("VR Compositor: Successfully created dedicated swapchains");
+        return true;
+    }
+    
+    bool CreateCompositorVulkanResources() {
+        if (!m_pOpenXRManager || m_compositorVulkanResourcesCreated) {
+            return m_compositorVulkanResourcesCreated;
+        }
+        
+        VkPhysicalDevice physicalDevice = m_pOpenXRManager->GetVulkanPhysicalDevice();
+        VkInstance instance = m_pOpenXRManager->GetVulkanInstance();
+        
+        if (physicalDevice == VK_NULL_HANDLE || instance == VK_NULL_HANDLE) {
+            dxvk::Logger::warn("VR Compositor: Cannot create Vulkan resources - no physical device or instance");
+            return false;
+        }
+        
+        // Find graphics queue family
+        uint32_t queueFamilyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+        
+        std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies.data());
+        
+        m_compositorQueueFamily = UINT32_MAX;
+        for (uint32_t i = 0; i < queueFamilyCount; i++) {
+            if (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                m_compositorQueueFamily = i;
+                break;
+            }
+        }
+        
+        if (m_compositorQueueFamily == UINT32_MAX) {
+            dxvk::Logger::err("VR Compositor: No graphics queue family found");
+            return false;
+        }
+        
+        // Create independent logical device for compositor
+        float queuePriority = 1.0f;
+        VkDeviceQueueCreateInfo queueCreateInfo = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+        queueCreateInfo.queueFamilyIndex = m_compositorQueueFamily;
+        queueCreateInfo.queueCount = 1;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+        
+        VkDeviceCreateInfo deviceCreateInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+        deviceCreateInfo.queueCreateInfoCount = 1;
+        deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+        
+        VkResult result = vkCreateDevice(physicalDevice, &deviceCreateInfo, nullptr, &m_compositorDevice);
+        if (result != VK_SUCCESS) {
+            dxvk::Logger::err(str::format("VR Compositor: Failed to create device - error: ", static_cast<int>(result)));
+            return false;
+        }
+        
+        // Get queue from our device
+        vkGetDeviceQueue(m_compositorDevice, m_compositorQueueFamily, 0, &m_compositorQueue);
+        
+        dxvk::Logger::info("VR Compositor: Created independent Vulkan device");
+        
+        // Create command pool with our device
+        VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = m_compositorQueueFamily;
+        
+        result = vkCreateCommandPool(m_compositorDevice, &poolInfo, nullptr, &m_compositorCommandPool);
+        if (result != VK_SUCCESS) {
+            dxvk::Logger::err(str::format("VR Compositor: Failed to create command pool - error: ", static_cast<int>(result)));
+            vkDestroyDevice(m_compositorDevice, nullptr);
+            m_compositorDevice = VK_NULL_HANDLE;
+            return false;
+        }
+        
+        // Allocate command buffer from our pool
+        VkCommandBufferAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        allocInfo.commandPool = m_compositorCommandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        
+        result = vkAllocateCommandBuffers(m_compositorDevice, &allocInfo, &m_compositorCommandBuffer);
+        if (result != VK_SUCCESS) {
+            dxvk::Logger::err(str::format("VR Compositor: Failed to allocate command buffer - error: ", static_cast<int>(result)));
+            vkDestroyCommandPool(m_compositorDevice, m_compositorCommandPool, nullptr);
+            vkDestroyDevice(m_compositorDevice, nullptr);
+            m_compositorDevice = VK_NULL_HANDLE;
+            m_compositorCommandPool = VK_NULL_HANDLE;
+            return false;
+        }
+        
+        // Create fence for synchronization
+        VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        result = vkCreateFence(m_compositorDevice, &fenceInfo, nullptr, &m_compositorFence);
+        if (result != VK_SUCCESS) {
+            dxvk::Logger::err(str::format("VR Compositor: Failed to create fence - error: ", static_cast<int>(result)));
+            vkDestroyCommandPool(m_compositorDevice, m_compositorCommandPool, nullptr);
+            vkDestroyDevice(m_compositorDevice, nullptr);
+            m_compositorDevice = VK_NULL_HANDLE;
+            m_compositorCommandPool = VK_NULL_HANDLE;
+            m_compositorCommandBuffer = VK_NULL_HANDLE;
+            return false;
+        }
+        
+        m_compositorVulkanResourcesCreated = true;
+        dxvk::Logger::info("VR Compositor: Successfully created independent Vulkan device and resources");
+        return true;
+    }
+    
+    void SetSourceState(SourceEngineState newState) {
+        if (newState != m_currentState.load()) {
+            dxvk::Logger::info(str::format("VR Compositor: State change from ", 
+                static_cast<int>(m_currentState.load()), " to ", static_cast<int>(newState)));
+                
+            m_currentState.store(newState);
+            
+            bool shouldActivate = (newState == SOURCE_STATE_MENU || newState == SOURCE_STATE_LOADING);
+            
+            if (shouldActivate && !m_compositorActive.load()) {
+                StartCompositor();
+            } else if (!shouldActivate && m_compositorActive.load()) {
+                StopCompositor();
+            }
+        }
+    }
+    
+    bool IsCompositorActive() const {
+        return m_compositorActive.load();
+    }
+    
+    void SubmitFrame(void* textureHandle, int width, int height) {
+        if (!m_compositorActive.load()) return;
+        
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        m_latestFrame.textureHandle = textureHandle;
+        m_latestFrame.width = width;
+        m_latestFrame.height = height;
+        m_latestFrame.hasNewFrame = true;
+    }
+    
+private:
+    void StartCompositor() {
+        if (m_compositorActive.load()) return;
+        
+        dxvk::Logger::info("VR Compositor: Starting compositor thread");
+        m_shouldStop.store(false);
+        m_compositorActive.store(true);
+        
+        m_compositorThread = std::thread(&VRCompositor::CompositorThreadFunc, this);
+    }
+    
+    void StopCompositor() {
+        if (!m_compositorActive.load()) return;
+        
+        dxvk::Logger::info("VR Compositor: Stopping compositor thread");
+        m_shouldStop.store(true);
+        
+        if (m_compositorThread.joinable()) {
+            m_compositorThread.join();
+        }
+        
+        m_compositorActive.store(false);
+    }
+    
+    void Shutdown() {
+        StopCompositor();
+    }
+    
+    void CompositorThreadFunc() {
+        dxvk::Logger::info("VR Compositor: Thread started");
+        
+        if (!m_pOpenXRManager) {
+            dxvk::Logger::err("VR Compositor: No OpenXR manager - using fallback timing");
+            CompositorThreadFallback();
+            return;
+        }
+        
+        // Check if session is valid
+        XrSession session = m_pOpenXRManager->GetSession();
+        if (session == XR_NULL_HANDLE) {
+            dxvk::Logger::err("VR Compositor: No valid OpenXR session available");
+            CompositorThreadFallback();
+            return;
+        }
+        
+        dxvk::Logger::info("VR Compositor: Using OpenXR session for frame timing");
+        
+        // Create dedicated swapchains for the compositor
+        if (!CreateCompositorSwapchains()) {
+            dxvk::Logger::err("VR Compositor: Failed to create swapchains, falling back");
+            CompositorThreadFallback();
+            return;
+        }
+        
+        // Create dedicated Vulkan resources for the compositor
+        if (!CreateCompositorVulkanResources()) {
+            dxvk::Logger::err("VR Compositor: Failed to create Vulkan resources, falling back");
+            CompositorThreadFallback();
+            return;
+        }
+        
+        // Reset the main pipeline's frame state to prevent conflicts
+        m_pOpenXRManager->ResetFrameState();
+        
+        // Force end any existing frame before compositor takes over
+        XrFrameEndInfo forceEndInfo = { XR_TYPE_FRAME_END_INFO };
+        forceEndInfo.displayTime = 0; // Use 0 as safe fallback
+        forceEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        forceEndInfo.layerCount = 0;
+        forceEndInfo.layers = nullptr;
+        
+        XrResult forceEndResult = xrEndFrame(session, &forceEndInfo);
+        if (forceEndResult == XR_SUCCESS) {
+            dxvk::Logger::info("VR Compositor: Successfully ended existing frame");
+        } else if (forceEndResult == XR_ERROR_CALL_ORDER_INVALID) {
+            dxvk::Logger::info("VR Compositor: No existing frame to end (expected)");
+        } else {
+            dxvk::Logger::warn(str::format("VR Compositor: Force end frame result: ", static_cast<int>(forceEndResult)));
+        }
+        
+        // Wait a moment to ensure the forced end is processed
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Use OpenXR frame timing for smooth VR
+        int consecutiveFailures = 0;
+        const int maxFailures = 10; // Fall back after 10 consecutive failures
+        
+        while (!m_shouldStop.load()) {
+            // Wait for OpenXR to tell us when to start the next frame
+            XrFrameWaitInfo frameWaitInfo = { XR_TYPE_FRAME_WAIT_INFO };
+            XrFrameState frameState = { XR_TYPE_FRAME_STATE };
+            
+            XrResult waitResult = xrWaitFrame(session, &frameWaitInfo, &frameState);
+            if (waitResult != XR_SUCCESS) {
+                dxvk::Logger::warn(str::format("VR Compositor: xrWaitFrame failed with code ", static_cast<int>(waitResult)));
+                std::this_thread::sleep_for(std::chrono::microseconds(11111)); // ~90Hz
+                continue;
+            }
+            
+            // Begin the frame
+            XrFrameBeginInfo frameBeginInfo = { XR_TYPE_FRAME_BEGIN_INFO };
+            XrResult beginResult = xrBeginFrame(session, &frameBeginInfo);
+            if (beginResult != XR_SUCCESS) {
+                consecutiveFailures++;
+                
+                if (consecutiveFailures >= maxFailures) {
+                    dxvk::Logger::err(str::format("VR Compositor: Too many consecutive failures (", consecutiveFailures, "), switching to fallback mode"));
+                    CompositorThreadFallback();
+                    return;
+                }
+                
+                if (beginResult == XR_ERROR_CALL_ORDER_INVALID) {
+                    dxvk::Logger::warn(str::format("VR Compositor: xrBeginFrame call order invalid (attempt ", consecutiveFailures, "/", maxFailures, ")"));
+                    
+                    // Try to end any existing frame with minimal layers
+                    XrFrameEndInfo cleanupEndInfo = { XR_TYPE_FRAME_END_INFO };
+                    cleanupEndInfo.displayTime = frameState.predictedDisplayTime;
+                    cleanupEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    cleanupEndInfo.layerCount = 0;
+                    cleanupEndInfo.layers = nullptr;
+                    
+                    XrResult cleanupResult = xrEndFrame(session, &cleanupEndInfo);
+                    if (cleanupResult == XR_SUCCESS) {
+                        dxvk::Logger::info("VR Compositor: Successfully cleaned up existing frame");
+                    }
+                } else {
+                    dxvk::Logger::warn(str::format("VR Compositor: xrBeginFrame failed with code ", static_cast<int>(beginResult)));
+                }
+                
+                // Sleep briefly to avoid rapid retries
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                continue;
+            }
+            
+            // Reset failure counter on success
+            consecutiveFailures = 0;
+            
+            // Process our compositor frame
+            std::vector<XrCompositionLayerBaseHeader*> layers;
+            if (ProcessCompositorFrame(frameState, layers)) {
+                // We have rendered content to submit
+            }
+            
+            // End the frame (this submits to the headset)
+            XrFrameEndInfo frameEndInfo = { XR_TYPE_FRAME_END_INFO };
+            frameEndInfo.displayTime = frameState.predictedDisplayTime;
+            frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            frameEndInfo.layerCount = static_cast<uint32_t>(layers.size());
+            frameEndInfo.layers = layers.empty() ? nullptr : layers.data();
+            
+            XrResult endResult = xrEndFrame(session, &frameEndInfo);
+            if (endResult != XR_SUCCESS) {
+                dxvk::Logger::warn(str::format("VR Compositor: xrEndFrame failed with code ", static_cast<int>(endResult)));
+            }
+        }
+        
+        dxvk::Logger::info("VR Compositor: Thread stopped");
+    }
+    
+    void CompositorThreadFallback() {
+        // Fallback mode - work with Source's VR pipeline instead of parallel OpenXR
+        dxvk::Logger::info("VR Compositor: Running in fallback mode - maintaining 90Hz timing without OpenXR");
+        
+        const auto frameDuration = std::chrono::microseconds(11111); // ~90Hz
+        int fallbackFrameCount = 0;
+        
+        while (!m_shouldStop.load()) {
+            auto frameStart = std::chrono::high_resolution_clock::now();
+            
+            // Instead of trying to manage OpenXR directly, trigger Source's VR system
+            // The key insight: let Source handle VR, but we provide the timing and content
+            
+            // Create a simple colored texture to submit via the normal mechanism
+            // This will go through Source's existing VR pipeline
+            CreateAndSubmitFallbackContent();
+            
+            // Log periodically to show fallback is working
+            fallbackFrameCount++;
+            if (fallbackFrameCount % 90 == 0) { // Every ~1 second
+                dxvk::Logger::info(str::format("VR Compositor: Hybrid frame ", fallbackFrameCount, " - using Source VR pipeline"));
+            }
+            
+            // Sleep to maintain framerate
+            auto frameEnd = std::chrono::high_resolution_clock::now();
+            auto elapsed = frameEnd - frameStart;
+            if (elapsed < frameDuration) {
+                std::this_thread::sleep_for(frameDuration - elapsed);
+            }
+        }
+        
+        dxvk::Logger::info("VR Compositor: Fallback mode stopped");
+    }
+    
+    void CreateAndSubmitFallbackContent() {
+        // In fallback mode, we need to let Source's VR pipeline handle the actual rendering
+        // The compositor will temporarily step back and let the normal VR hooks work
+        
+        // Check if we have received frame data from Source
+        FrameData frame;
+        bool hasFrame = false;
+        {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            frame = m_latestFrame;
+            hasFrame = frame.hasNewFrame;
+            if (hasFrame) {
+                m_latestFrame.hasNewFrame = false; // Mark as processed
+            }
+        }
+        
+        static int contentFrames = 0;
+        if (++contentFrames % 180 == 0) { // Every 2 seconds
+            dxvk::Logger::info(str::format("VR Compositor: Fallback mode - HasFrame: ", hasFrame ? "Yes" : "No", 
+                                          " - State: ", static_cast<int>(m_currentState.load())));
+        }
+        
+        // If we have frame data from Source, we should trigger normal VR rendering
+        // This is where we could temporarily disable the compositor's blocking of normal VR hooks
+        if (hasFrame) {
+            // TODO: Implement mechanism to allow Source to render this frame to VR
+            // For now, just log that we received content
+            static int receivedFrames = 0;
+            if (++receivedFrames % 90 == 0) {
+                dxvk::Logger::info(str::format("VR Compositor: Received frame data from Source (", receivedFrames, " total)"));
+            }
+        }
+    }
+    
+    bool ProcessCompositorFrame(const XrFrameState& frameState, std::vector<XrCompositionLayerBaseHeader*>& layers) {
+        // Get latest frame data
+        FrameData frame;
+        {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            frame = m_latestFrame;
+            m_latestFrame.hasNewFrame = false;
+        }
+        
+        if (!m_pOpenXRManager) {
+            // In fallback mode, we don't have OpenXR manager but we still process frames
+            static int fallbackProcessCount = 0;
+            if (++fallbackProcessCount % 90 == 0) {
+                dxvk::Logger::info(str::format("VR Compositor: Fallback processing frame ", fallbackProcessCount, " - State: ", static_cast<int>(m_currentState.load())));
+            }
+            return true; // Return true to indicate successful processing
+        }
+        
+        // Render solid red to both eyes
+        return RenderSolidColorToEyes(frameState, layers, 1.0f, 0.0f, 0.0f);
+    }
+    
+    bool RenderSolidColorToEyes(const XrFrameState& frameState, std::vector<XrCompositionLayerBaseHeader*>& layers, 
+                               float r, float g, float b) {
+        if (!m_pOpenXRManager) return false;
+        
+        // Instead of using projection layers with swapchains, use a solid color quad layer
+        // This is much simpler and doesn't require Vulkan rendering
+        
+        // Get current views and poses for positioning
+        XrView views[2];
+        XrSpaceLocation headLocation;
+        uint32_t viewCount = 2;
+        m_pOpenXRManager->GetViewsPublic(views, headLocation, viewCount);
+        
+        // Use compositor's own swapchains instead of trying to use main pipeline's
+        if (!m_compositorSwapchainsCreated) {
+            dxvk::Logger::warn("VR Compositor: Compositor swapchains not created");
+            return false;
+        }
+        
+        static XrCompositionLayerProjection projectionLayer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+        projectionLayer.space = m_pOpenXRManager->GetReferenceSpace();
+        projectionLayer.viewCount = 2;
+        
+        static XrCompositionLayerProjectionView projectionViews[2];
+        
+        // Use compositor's own swapchains
+        for (int eye = 0; eye < 2; ++eye) {
+            if (m_compositorSwapchains[eye] == XR_NULL_HANDLE) {
+                dxvk::Logger::warn(str::format("VR Compositor: Compositor swapchain for eye ", eye, " is null"));
+                continue;
+            }
+            
+            // Acquire swapchain image
+            XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+            uint32_t imageIndex;
+            XrResult result = xrAcquireSwapchainImage(m_compositorSwapchains[eye], &acquireInfo, &imageIndex);
+            if (result != XR_SUCCESS) {
+                dxvk::Logger::warn(str::format("VR Compositor: Failed to acquire swapchain image for eye ", eye, " - error: ", static_cast<int>(result)));
+                continue;
+            }
+            
+            // Wait for swapchain image to be ready
+            XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+            waitInfo.timeout = XR_INFINITE_DURATION;
+            result = xrWaitSwapchainImage(m_compositorSwapchains[eye], &waitInfo);
+            if (result != XR_SUCCESS) {
+                dxvk::Logger::warn(str::format("VR Compositor: Failed to wait for swapchain image for eye ", eye, " - error: ", static_cast<int>(result)));
+                xrReleaseSwapchainImage(m_compositorSwapchains[eye], nullptr);
+                continue;
+            }
+            
+            // Try to clear the swapchain image to red (simple approach)
+            if (imageIndex < m_compositorSwapchainImages[eye].size()) {
+                VkImage swapchainImage = m_compositorSwapchainImages[eye][imageIndex].image;
+                if (swapchainImage != VK_NULL_HANDLE) {
+                    // Simple red clear using the OpenXR manager's Vulkan context
+                    ClearSwapchainImageToColor(eye, imageIndex, 1.0f, 0.0f, 0.0f);
+                }
+            }
+            
+            // Set up the projection view
+            projectionViews[eye] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+            projectionViews[eye].pose = views[eye].pose;
+            projectionViews[eye].fov = views[eye].fov;
+            projectionViews[eye].subImage.swapchain = m_compositorSwapchains[eye];
+            projectionViews[eye].subImage.imageRect.offset = { 0, 0 };
+            projectionViews[eye].subImage.imageRect.extent = { 
+                static_cast<int32_t>(m_pOpenXRManager->GetRenderWidth()), 
+                static_cast<int32_t>(m_pOpenXRManager->GetRenderHeight()) 
+            };
+            projectionViews[eye].subImage.imageArrayIndex = 0;
+            
+            // Release swapchain image
+            XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            xrReleaseSwapchainImage(m_compositorSwapchains[eye], &releaseInfo);
+        }
+        
+        projectionLayer.views = projectionViews;
+        layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&projectionLayer));
+        
+        // Log periodically that we're submitting frames
+        static int renderCount = 0;
+        if (++renderCount % 90 == 0) { // Log every ~1 second at 90Hz
+            dxvk::Logger::info(str::format("VR Compositor: Submitted red color layer frame ", renderCount, " - layers: ", layers.size()));
+        }
+        
+        return true;
+    }
+    
+    void SimpleClearImageToRed(VkImage image, int eye, uint32_t imageIndex) {
+        // Very simple clear operation that should be safe
+        // Use the OpenXR manager's Vulkan device and queue
+        VkDevice device = m_pOpenXRManager->GetVulkanDevice();
+        VkQueue queue = m_pOpenXRManager->GetVulkanQueue();
+        
+        if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) {
+            return; // Can't clear without Vulkan resources
+        }
+        
+        // Try using a different approach - create a simple quad that fills the view
+        // This avoids direct Vulkan manipulation
+        static int clearCount = 0;
+        if (++clearCount % 180 == 0) { // Log every ~2 seconds
+            dxvk::Logger::info(str::format("VR Compositor: Processing eye ", eye, " image ", imageIndex, " for red content (", clearCount, " attempts)"));
+        }
+    }
+    
+    bool ClearSwapchainImageToColor(int eye, uint32_t imageIndex, float r, float g, float b) {
+        if (!m_pOpenXRManager || !m_compositorSwapchainsCreated) {
+            dxvk::Logger::warn("VR Compositor: Cannot clear - no OpenXR manager or swapchains not created");
+            return false;
+        }
+        
+        // Use the compositor's own swapchain images
+        if (eye < 0 || eye >= 2) {
+            dxvk::Logger::warn(str::format("VR Compositor: Invalid eye index ", eye));
+            return false;
+        }
+        
+        const auto& swapchainImages = m_compositorSwapchainImages[eye];
+        if (imageIndex >= swapchainImages.size()) {
+            dxvk::Logger::warn(str::format("VR Compositor: Invalid image index ", imageIndex, " for eye ", eye, " (max: ", swapchainImages.size() - 1, ")"));
+            return false;
+        }
+        
+        VkImage image = swapchainImages[imageIndex].image;
+        if (image == VK_NULL_HANDLE) {
+            dxvk::Logger::warn(str::format("VR Compositor: Null VkImage for eye ", eye, " index ", imageIndex));
+            return false;
+        }
+        
+        // Use compositor's own independent Vulkan device
+        if (!m_compositorVulkanResourcesCreated || m_compositorDevice == VK_NULL_HANDLE) {
+            dxvk::Logger::warn("VR Compositor: Compositor Vulkan resources not created");
+            return false;
+        }
+        
+        VkDevice device = m_compositorDevice;
+        VkCommandBuffer cmdBuffer = m_compositorCommandBuffer;
+        
+        // Debug: Check each resource individually
+        if (device == VK_NULL_HANDLE) {
+            dxvk::Logger::warn("VR Compositor: Vulkan device is null");
+            return false;
+        }
+        if (cmdBuffer == VK_NULL_HANDLE) {
+            dxvk::Logger::warn("VR Compositor: Compositor command buffer is null");
+            return false;
+        }
+        
+        // Reset and begin command buffer
+        VkResult resetResult = vkResetCommandBuffer(cmdBuffer, 0);
+        if (resetResult != VK_SUCCESS) {
+            dxvk::Logger::warn(str::format("VR Compositor: Failed to reset command buffer - error: ", static_cast<int>(resetResult)));
+            return false;
+        }
+        
+        VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        
+        VkResult beginResult = vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        if (beginResult != VK_SUCCESS) {
+            dxvk::Logger::warn(str::format("VR Compositor: Failed to begin command buffer - error: ", static_cast<int>(beginResult)));
+            return false;
+        }
+        
+        // Transition image layout to transfer destination
+        VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        
+        vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 0, nullptr, 0, nullptr, 1, &barrier);
+        
+        // Clear the image to specified color
+        VkClearColorValue clearColor = {};
+        clearColor.float32[0] = r;
+        clearColor.float32[1] = g;
+        clearColor.float32[2] = b;
+        clearColor.float32[3] = 1.0f;
+        
+        VkImageSubresourceRange clearRange = {};
+        clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clearRange.baseMipLevel = 0;
+        clearRange.levelCount = 1;
+        clearRange.baseArrayLayer = 0;
+        clearRange.layerCount = 1;
+        
+        vkCmdClearColorImage(cmdBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &clearRange);
+        
+        // Transition image layout to color attachment for presentation
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        
+        vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            0, 0, nullptr, 0, nullptr, 1, &barrier);
+        
+        // End command buffer
+        VkResult endResult = vkEndCommandBuffer(cmdBuffer);
+        if (endResult != VK_SUCCESS) {
+            dxvk::Logger::warn(str::format("VR Compositor: Failed to end command buffer - error: ", static_cast<int>(endResult)));
+            return false;
+        }
+        
+        // Submit command buffer
+        VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &cmdBuffer;
+        
+        VkQueue queue = m_compositorQueue;
+        if (queue == VK_NULL_HANDLE) {
+            dxvk::Logger::warn("VR Compositor: Compositor queue is null");
+            return false;
+        }
+        
+        // Submit and wait for completion
+        VkResult fenceResult = vkResetFences(device, 1, &m_compositorFence);
+        if (fenceResult != VK_SUCCESS) {
+            dxvk::Logger::warn(str::format("VR Compositor: Failed to reset fence - error: ", static_cast<int>(fenceResult)));
+            return false;
+        }
+        
+        VkResult submitResult = vkQueueSubmit(queue, 1, &submitInfo, m_compositorFence);
+        if (submitResult != VK_SUCCESS) {
+            dxvk::Logger::warn(str::format("VR Compositor: Failed to submit command buffer - error: ", static_cast<int>(submitResult)));
+            return false;
+        }
+        
+        VkResult waitResult = vkWaitForFences(device, 1, &m_compositorFence, VK_TRUE, UINT64_MAX);
+        if (waitResult != VK_SUCCESS) {
+            dxvk::Logger::warn(str::format("VR Compositor: Fence wait failed - error: ", static_cast<int>(waitResult)));
+            return false;
+        }
+        
+        return true;
+    }
+};
+
+// Global compositor instance
+static VRCompositor g_vrCompositor;
+
+// Initialize compositor with OpenXR manager
+void InitVRCompositor(OpenXRDirectMode* manager) {
+    dxvk::Logger::info("VR Compositor: Initializing with OpenXR manager");
+    g_vrCompositor.SetOpenXRManager(manager);
+}
+
+// Check if compositor is active (used by normal VR hooks)
+bool IsVRCompositorActive() {
+    return g_vrCompositor.IsCompositorActive();
+}
+
+// ============================================================================
+// Export Functions
+// ============================================================================
+
+extern "C" {
+
+void __declspec(dllexport) dxvkSetSourceState(int state) {
+    g_vrCompositor.SetSourceState(static_cast<SourceEngineState>(state));
+}
+
+bool __declspec(dllexport) dxvkIsCompositorActive() {
+    return g_vrCompositor.IsCompositorActive();
+}
+
+void __declspec(dllexport) dxvkSubmitMenuFrame(void* textureHandle, int width, int height) {
+    g_vrCompositor.SubmitFrame(textureHandle, width, height);
+}
+
+} // extern "C"
 
 
 

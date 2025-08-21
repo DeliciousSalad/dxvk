@@ -66,6 +66,15 @@ class OpenXRDirectMode : public HMDInterface,
 	public VkSubmitThreadCallback
 {
 public:
+	// Swapchain structure for public access
+	struct SwapchainInfo {
+		XrSwapchain handle;
+		std::vector<SwapchainImageData> images;
+		uint32_t width;
+		uint32_t height;
+		int64_t format;
+	};
+
 	OpenXRDirectMode();
 	virtual ~OpenXRDirectMode() override;
 
@@ -90,6 +99,23 @@ public:
 	virtual void StoreSharedTexture(int index, VulkanTextureData* vulkanData) override;
 
 	virtual void OnRenderTargetChanged(dxvk::Rc<dxvk::DxvkDevice> device, dxvk::D3D9Surface* rt) override;
+
+	// Public accessor methods for VRCompositor
+	XrSession GetSession() const { return m_session; }
+	XrSpace GetReferenceSpace() const { return m_referenceSpace; }
+	VkDevice GetVulkanDevice() const { return m_vkDevice; }
+	VkQueue GetVulkanQueue() const { return m_vkQueue; }
+	uint32_t GetRenderWidth() const { return m_nRenderWidth; }
+	uint32_t GetRenderHeight() const { return m_nRenderHeight; }
+	const std::vector<SwapchainInfo>& GetEyeSwapchains() const { return m_eyeSwapchains; }
+	VkCommandBuffer GetCommandBuffer() const { 
+		return m_commandBuffers.empty() ? VK_NULL_HANDLE : m_commandBuffers[m_currentCommandBufferIndex]; 
+	}
+	uint32_t GetGraphicsQueueFamily() const { return m_vkQueueFamilyIndex; }
+	VkPhysicalDevice GetVulkanPhysicalDevice() const { return m_vkPhysicalDevice; }
+	VkInstance GetVulkanInstance() const { return m_vkInstance; }
+        void GetViewsPublic(XrView* views, XrSpaceLocation& headLocation, uint32_t& viewCount);
+        void ResetFrameState(); // Reset frame tracking for compositor takeover
 
 private:
 	uint32_t m_nRenderWidth;
@@ -142,13 +168,6 @@ private:
 	std::vector<XrCompositionLayerProjectionView> m_projectionViews;
 
 	// Swapchains for each eye
-	struct SwapchainInfo {
-		XrSwapchain handle;
-		std::vector<SwapchainImageData> images;
-		uint32_t width;
-		uint32_t height;
-		int64_t format;
-	};
 	std::vector<SwapchainInfo> m_eyeSwapchains;
 
 	// Format conversion flags

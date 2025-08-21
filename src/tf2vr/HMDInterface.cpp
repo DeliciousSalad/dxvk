@@ -23,17 +23,34 @@ void notimplemented(const char *function)
 
 extern "C" bool __declspec(dllexport) dxvkInitOpenXR(XrInstance instance, XrSystemId systemId, XrSession session, XrSpace referenceSpace, XrSpace headSpace)
 {
-	return g_pHMDInterface->Init(instance, systemId, session, referenceSpace, headSpace);
+	bool result = g_pHMDInterface->Init(instance, systemId, session, referenceSpace, headSpace);
+	
+	// Initialize VR compositor with the OpenXR manager
+	if (result) {
+		InitVRCompositor(static_cast<OpenXRDirectMode*>(g_pHMDInterface));
+	}
+	
+	return result;
 }
 
 
 extern "C" bool __declspec(dllexport) dxvkBeginFrame()
 {
+	// Don't allow normal VR hooks when compositor is active
+	if (IsVRCompositorActive()) {
+		return false; // Compositor handles frame timing
+	}
+	
 	return g_pHMDInterface->BeginFrame();
 }
 
 extern "C" bool __declspec(dllexport) dxvkEndFrame()
 {
+	// Don't allow normal VR hooks when compositor is active
+	if (IsVRCompositorActive()) {
+		return false; // Compositor handles frame timing
+	}
+	
 	return g_pHMDInterface->EndFrame();
 }
 
