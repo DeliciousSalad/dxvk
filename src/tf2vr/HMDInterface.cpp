@@ -1,6 +1,7 @@
 #include "HMDInterface.h"
 
 #include "OpenXRDirectMode.h"
+#include "VRCompositor.h"  // For SourceEngineState enum
 
 #include "hmdWrapper.h"
 #include "../util/log/log.h"

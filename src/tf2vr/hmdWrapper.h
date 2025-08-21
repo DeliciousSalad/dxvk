@@ -2,13 +2,7 @@
 
 #include "openxr/openxr.h"
 
-// Source Engine State for VR Compositor
-enum SourceEngineState {
-    SOURCE_STATE_GAMEPLAY = 0,     // Normal game - Source handles VR
-    SOURCE_STATE_MENU = 1,         // Main menu - compositor takes over
-    SOURCE_STATE_LOADING = 2,      // Loading screen - compositor takes over
-    SOURCE_STATE_TRANSITION = 3    // Brief transitions
-};
+// Note: SourceEngineState enum moved to VRCompositor.h to avoid circular dependencies
 
 extern "C" bool __declspec(dllexport) dxvkInitOpenXR(XrInstance instance, XrSystemId systemId, XrSession session, XrSpace referenceSpace, XrSpace headSpace);
 extern "C" void __declspec(dllexport) dxvkShutdownOpenXR();

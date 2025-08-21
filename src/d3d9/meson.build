@@ -49,6 +49,7 @@ d3d9_src = [
   'd3d9_bridge.cpp',
   '../tf2vr/HMDInterface.cpp',
   '../tf2vr/OpenXRDirectMode.cpp',
+  '../tf2vr/VRCompositor.cpp',
 ]
 
 d3d9_ld_args      = []

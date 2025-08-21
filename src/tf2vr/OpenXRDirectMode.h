@@ -5,6 +5,7 @@
 
 #include "HMDInterface.h"
 #include "VkSubmitThreadCallback.h"
+#include "VRCompositor.h"
 
 #include <vector>
 #include <string>
@@ -19,6 +20,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+
+
 
 // Structure to hold swapchain image information
 struct SwapchainImageData {
@@ -79,6 +82,7 @@ public:
 	virtual ~OpenXRDirectMode() override;
 
 	virtual bool Init(XrInstance instance, XrSystemId systemId, XrSession session, XrSpace referenceSpace, XrSpace headSpace) override;
+	void TryInitializeVRCompositor();
 
 	virtual VkSubmitThreadCallback* GetVkSubmitThreadCallback() override;
 
@@ -215,6 +219,9 @@ private:
 	double GetAverageTime(const std::vector<double>& times) const;
 
 	float m_displayRefreshRate;
+	
+	// VR Compositor for independent menu rendering
+	std::unique_ptr<dxvk::VRCompositor> m_vrCompositor;
 };
 
 #endif //OPENXRDIRECTMODE_H_INCLUDED

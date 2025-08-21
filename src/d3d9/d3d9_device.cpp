@@ -18,6 +18,10 @@
 #include "d3d9_format_helpers.h"
 
 #include "../dxvk/dxvk_adapter.h"
+#include "../tf2vr/hmdWrapper.h"
+
+// Forward declaration for VGUI tracking function
+extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3D9CommonTexture* texture);
 #include "../dxvk/dxvk_instance.h"
 
 #include "../util/util_bit.h"
@@ -1622,6 +1626,31 @@ namespace dxvk {
     D3D9CommonTexture* texInfo = rt != nullptr
       ? rt->GetCommonTexture()
       : nullptr;
+
+    // TF2VR: Track _rt_vgui render target for VR compositor
+    if (rt != nullptr && texInfo != nullptr) {
+      // Use a more specific heuristic to identify VGUI render targets:
+      // 1. Must be a render target (has D3DUSAGE_RENDERTARGET)
+      // 2. Must be the primary render target (index 0)
+      // 3. Should be screen-sized (likely 1280x720, 1920x1080, etc.)
+      // 4. Should have alpha channel (for UI transparency)
+      // 5. Track only when VR compositor is active (to avoid tracking unnecessary textures)
+      
+      auto desc = texInfo->Desc();
+      if ((desc->Usage & D3DUSAGE_RENDERTARGET) && 
+          RenderTargetIndex == 0 &&
+          IsVRCompositorActive() &&
+          desc->Width >= 1024 && desc->Height >= 576 &&
+          desc->Width <= 4096 && desc->Height <= 4096 &&  // Reasonable screen size bounds
+          (desc->Format == D3D9Format::A8R8G8B8 || desc->Format == D3D9Format::X8R8G8B8)) {  // Common UI formats
+        
+        // Additional heuristic: check if this looks like a screen-sized UI texture
+        float aspectRatio = (float)desc->Width / desc->Height;
+        if (aspectRatio >= 1.0f && aspectRatio <= 2.5f) {  // Reasonable aspect ratios for UI
+          TF2VR_TrackVGUIRenderTarget(rt, texInfo);
+        }
+      }
+    }
 
     if (unlikely(rt != nullptr && !(texInfo->Desc()->Usage & D3DUSAGE_RENDERTARGET)))
       return D3DERR_INVALIDCALL;
