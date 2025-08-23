@@ -560,10 +560,10 @@ bool VRCompositor::RenderEye(int eye) {
     // Get the Vulkan image
     VkImage swapchainImage = m_compositorSwapchainImages[eye][imageIndex].image;
     
-    // Transition image to color attachment optimal
+    // Transition image to transfer destination optimal for clearing
     VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = swapchainImage;
@@ -573,19 +573,17 @@ bool VRCompositor::RenderEye(int eye) {
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
     barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     
     vkCmdPipelineBarrier(m_compositorCommandBuffer,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
                         0, 0, nullptr, 0, nullptr, 1, &barrier);
     
-    // Render a bright cyan quad (for now, just clear to cyan - 3D pipeline will be implemented later)
-    Logger::info(str::format("VRCompositor: Eye ", eye, " rendering bright cyan quad"));
+    // Clear to bright cyan
+    Logger::info(str::format("VRCompositor: Eye ", eye, " clearing to bright cyan"));
     
-    // For now, clear to bright cyan to show our 3D quad concept works
-    // TODO: Implement proper 3D Vulkan pipeline with vertex buffers, MVP matrix, shaders, etc.
-    VkClearColorValue clearColor = { { 0.0f, 1.0f, 1.0f, 1.0f } }; // Bright cyan (our target color)
+    VkClearColorValue clearColor = { { 0.0f, 1.0f, 1.0f, 1.0f } }; // Bright cyan
     VkImageSubresourceRange clearRange = {};
     clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     clearRange.baseMipLevel = 0;
@@ -593,7 +591,27 @@ bool VRCompositor::RenderEye(int eye) {
     clearRange.baseArrayLayer = 0;
     clearRange.layerCount = 1;
     
-    vkCmdClearColorImage(m_compositorCommandBuffer, swapchainImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, &clearColor, 1, &clearRange);
+    vkCmdClearColorImage(m_compositorCommandBuffer, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &clearRange);
+    
+    // Transition image to color attachment optimal for presentation
+    VkImageMemoryBarrier presentBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    presentBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    presentBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    presentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    presentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    presentBarrier.image = swapchainImage;
+    presentBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    presentBarrier.subresourceRange.baseMipLevel = 0;
+    presentBarrier.subresourceRange.levelCount = 1;
+    presentBarrier.subresourceRange.baseArrayLayer = 0;
+    presentBarrier.subresourceRange.layerCount = 1;
+    presentBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    presentBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    
+    vkCmdPipelineBarrier(m_compositorCommandBuffer,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &presentBarrier);
     Logger::info(str::format("VRCompositor: Eye ", eye, " - cleared to bright cyan (3D quad placeholder)"));
     
     // Release the swapchain image
@@ -813,16 +831,9 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
-    // Render both eyes
-    bool eye0Rendered = RenderEye(0);
-    bool eye1Rendered = RenderEye(1);
-    bool rendered = eye0Rendered && eye1Rendered;
-    
-    // Create OpenXR layers
+    // Use RenderFrame instead of calling RenderEye directly
     std::vector<XrCompositionLayerBaseHeader*> layers;
-    if (rendered) {
-        CreateOpenXRLayer(frameState, layers);
-    }
+    bool rendered = RenderFrame(frameState, layers);
     
     // End the frame
     XrFrameEndInfo frameEndInfo = { XR_TYPE_FRAME_END_INFO };
