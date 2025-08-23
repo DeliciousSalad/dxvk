@@ -516,7 +516,7 @@ bool VRCompositor::CreateCompositorSwapchains() {
             return false;
         }
         
-        m_compositorSwapchainImages[eye].resize(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR });
+        m_compositorSwapchainImages[eye].resize(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR });
         result = xrEnumerateSwapchainImages(m_compositorSwapchains[eye], imageCount, &imageCount,
                                            reinterpret_cast<XrSwapchainImageBaseHeader*>(m_compositorSwapchainImages[eye].data()));
         if (XR_FAILED(result)) {
@@ -614,6 +614,29 @@ bool VRCompositor::CreateOpenXRLayer(const XrFrameState& frameState, std::vector
         return false;
     }
     
+    // Get current view poses from OpenXR to fix XR_ERROR_POSE_INVALID
+    XrViewLocateInfo viewLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+    viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    viewLocateInfo.displayTime = frameState.predictedDisplayTime;
+    viewLocateInfo.space = m_cachedReferenceSpace;
+    
+    XrViewState viewState = { XR_TYPE_VIEW_STATE };
+    std::vector<XrView> views(2, { XR_TYPE_VIEW });
+    uint32_t viewCount = 2;
+    
+    XrResult result = xrLocateViews(m_cachedSession, &viewLocateInfo, &viewState, viewCount, &viewCount, views.data());
+    if (XR_FAILED(result)) {
+        Logger::warn(str::format("VRCompositor: xrLocateViews failed - error: ", static_cast<int>(result)));
+        return false;
+    }
+    
+    // Check if views are valid to prevent XR_ERROR_POSE_INVALID
+    if (!(viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
+        !(viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+        Logger::warn("VRCompositor: Views not valid - skipping layer creation");
+        return false;
+    }
+    
     // Create a simple projection layer for the compositor
     static XrCompositionLayerProjection projectionLayer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
     static XrCompositionLayerProjectionView projectionViews[2];
@@ -622,23 +645,22 @@ bool VRCompositor::CreateOpenXRLayer(const XrFrameState& frameState, std::vector
     projectionLayer.viewCount = 2;
     projectionLayer.views = projectionViews;
     
-    // Set up projection views for both eyes
+    // Set up projection views for both eyes with VALID poses
     for (int eye = 0; eye < 2; eye++) {
         projectionViews[eye] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+        projectionViews[eye].pose = views[eye].pose;  // Use VALID poses from xrLocateViews
+        projectionViews[eye].fov = views[eye].fov;    // Use VALID FOV from xrLocateViews
         projectionViews[eye].subImage.swapchain = m_compositorSwapchains[eye];
         projectionViews[eye].subImage.imageRect.offset = { 0, 0 };
         projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(m_cachedRenderWidth);
         projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(m_cachedRenderHeight);
         projectionViews[eye].subImage.imageArrayIndex = 0;
-        
-        // Use cached view data (pose and FOV)
-        // These will be set by OpenXR during the frame
     }
     
     // Add the layer to the layers vector
     layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&projectionLayer));
     
-    Logger::info(str::format("VRCompositor: ✅ Created OpenXR projection layer - viewCount: ", projectionLayer.viewCount));
+    Logger::info(str::format("VRCompositor: ✅ Created OpenXR projection layer with valid poses - viewCount: ", projectionLayer.viewCount));
     return true;
 }
 
@@ -751,6 +773,13 @@ void VRCompositor::SetupMVPMatrix() {
 }
 
 bool VRCompositor::RunIndependentFrame() {
+    static int frameCount = 0;
+    frameCount++;
+    
+    if (frameCount == 1) {
+        Logger::info("VRCompositor: 🧵 First RunIndependentFrame called - thread is running!");
+    }
+    
     if (!m_pOpenXRManager) {
         Logger::warn("VRCompositor: RunIndependentFrame failed - no OpenXR manager");
         return false;

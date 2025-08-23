@@ -55,7 +55,7 @@ private:
     
     // Compositor's own OpenXR resources
     XrSwapchain m_compositorSwapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
-    std::vector<XrSwapchainImageVulkanKHR> m_compositorSwapchainImages[2];
+    std::vector<XrSwapchainImageVulkan2KHR> m_compositorSwapchainImages[2];
     bool m_compositorSwapchainsCreated = false;
     
     // Compositor's own Vulkan resources (completely independent device)
