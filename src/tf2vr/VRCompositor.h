@@ -100,6 +100,7 @@ private:
     // 3D rendering data
     QuadVertex m_quadVertices[4];
     Matrix4x4 m_mvpMatrix;
+    bool m_has3DQuad = false;
     
     VkCommandBuffer m_compositorCommandBuffer = VK_NULL_HANDLE;
     VkFence m_compositorFence = VK_NULL_HANDLE;
@@ -180,6 +181,12 @@ private:
     // Vulkan resource management
     bool CreateIndependentVulkanDevice();
     bool CreateCompositorSwapchains();
+            bool CreateVulkanPipeline();
+        bool CreateVertexBuffer();
+        bool CreateSimple3DQuad();
+        bool CreateWorkingVulkanPipeline();
+        void Render3DQuad(int eye, VkImage targetImage, XrTime displayTime);
+        void RenderSimpleQuad(int eye, VkImage targetImage);
     void CleanupVulkanResources();
     
     // Graphics pipeline setup
@@ -192,32 +199,17 @@ private:
     bool CreateSimpleFallbackTexture();
     bool CreateGraphicsPipeline();
     
-    // Rendering operations
-    bool BeginTrue3DRenderPass(VkImage targetImage);
-    void EndTrue3DRenderPass();
-    bool SubmitTrue3DCommands();
-    bool RenderTrue3DQuad(VkImage targetImage, const QuadVertex vertices[4], const Matrix4x4& mvp);
+
     
-    // Texture and vertex operations
-    bool CreateVertexBuffer(const QuadVertex vertices[4]);
-    bool UpdateDescriptorSet(VkImage textureImage, VkImageView textureImageView);
-    bool TransitionImageLayout(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout);
+    // 3D MVP calculation
+    bool CalculateMVPMatrixForEye(int eye, XrTime displayTime, float* mvpMatrix);
+    void CreateViewMatrix(const XrPosef& pose, float* viewMatrix);
+    void CreateProperViewMatrix(const XrPosef& pose, float* viewMatrix);
+    void CreateProperProjectionMatrix(const XrFovf& fov, float* projMatrix);
+    void MultiplyMatrix4x4(const float* a, const float* b, float* result);
+    
+    // Vulkan helper functions
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
-    
-    // Helper functions
-    bool EnsureFramebufferCreated(VkImage targetImage);
-    void SetupQuadVertices(QuadVertex vertices[4], const MenuQuad3D& quad3D);
-    Matrix4x4 CalculateMVPMatrix(const XrView& view, const MenuQuad3D& quad3D);
-    
-    // Matrix operations
-    Matrix4x4 CreateTranslationMatrix(float x, float y, float z);
-    Matrix4x4 CreateViewMatrixFromPose(const XrPosef& pose);
-    Matrix4x4 CreateProjectionMatrixFromFOV(const XrFovf& fov);
-    Matrix4x4 MultiplyMatrices(const Matrix4x4& a, const Matrix4x4& b);
-    
-    // Rendering helpers
-    bool Render3DTexturedQuad(int eye, uint32_t imageIndex, const FrameData& frame, const XrView& view, const MenuQuad3D& quad3D);
-    bool RenderVGUITextureToEyes(const XrFrameState& frameState, std::vector<XrCompositionLayerBaseHeader*>& layers, const FrameData& frame);
     
     // Texture copying and management
     bool EnsureCopiedTextureCreated(int width, int height);
@@ -226,7 +218,7 @@ private:
     void CompositorThreadFunc();
     
     // Basic rendering methods
-    bool RenderEye(int eye);
+    bool RenderEye(int eye, const XrFrameState& frameState);
     bool CreateOpenXRLayer(const XrFrameState& frameState, std::vector<XrCompositionLayerBaseHeader*>& layers);
     
     // Texture copying helpers
