@@ -214,7 +214,6 @@ private:
     // Texture copying and management
     bool EnsureCopiedTextureCreated(int width, int height);
     bool PerformImmediateCopy(VkImage sourceTexture, int width, int height);
-    void CheckAndCopyTrackedVGUITexture();
     void CompositorThreadFunc();
     
     // Basic rendering methods
@@ -228,6 +227,9 @@ private:
     // 3D rendering setup
     void SetupQuadVertices();
     void SetupMVPMatrix();
+    
+    // Texture management
+    void UpdateDescriptorSetWithTexture(VkImageView textureView);
     
     // Compositor thread management
     void StartCompositor();

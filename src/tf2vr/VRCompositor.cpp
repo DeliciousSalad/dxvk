@@ -1,12 +1,21 @@
 #include "VRCompositor.h"
+#include "hmdWrapper.h"
 #include "../util/util_string.h"
 #include "../util/log/log.h"
 
 #include <tf2vr_vr_quad_frag.h>
 #include <tf2vr_vr_quad_vert.h>
+#include <chrono>
 
 // Forward declare what we need from OpenXRDirectMode
 class OpenXRDirectMode;
+
+// Forward declare VGUI texture checking function
+extern void CheckAndCopyTrackedVGUITexture();
+
+// Forward declare compositor synchronization function
+extern "C" void TF2VR_CompositorBeginTextureSync();
+extern std::timed_mutex* GetPresentSyncMutex();
 
 namespace dxvk {
     
@@ -366,11 +375,240 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
         return false;
     }
     
-    Logger::info(str::format("VRCompositor: 📸 Texture submitted - VkImage: ", (void*)sourceTexture, " size: ", width, "x", height));
-    Logger::info("VRCompositor: Using 3D colored quad instead of texture copying");
+    static int copyCallCount = 0;
+    copyCallCount++;
     
-    // For now, we'll render our own 3D colored quad instead of copying textures
-    // This simplifies the implementation and focuses on getting 3D rendering working
+    Logger::info(str::format("VRCompositor: 🎯 FRAME-COMPLETE COPY #", copyCallCount, " - VkImage: ", (void*)sourceTexture, " size: ", width, "x", height));
+    
+    // Check if we need to recreate the copied texture with new dimensions
+    if (m_copiedTextureWidth != width || m_copiedTextureHeight != height || m_copiedMenuTexture == VK_NULL_HANDLE) {
+        
+        // Clean up existing texture if it exists
+        if (m_copiedMenuTextureView != VK_NULL_HANDLE) {
+            vkDestroyImageView(m_compositorDevice, m_copiedMenuTextureView, nullptr);
+            m_copiedMenuTextureView = VK_NULL_HANDLE;
+        }
+        if (m_copiedMenuTexture != VK_NULL_HANDLE) {
+            vkDestroyImage(m_compositorDevice, m_copiedMenuTexture, nullptr);
+            m_copiedMenuTexture = VK_NULL_HANDLE;
+        }
+        if (m_copiedMenuTextureMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(m_compositorDevice, m_copiedMenuTextureMemory, nullptr);
+            m_copiedMenuTextureMemory = VK_NULL_HANDLE;
+        }
+        
+        // Create new copied texture with the source dimensions
+        VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = VK_FORMAT_B8G8R8A8_SRGB; // Match swapchain SRGB format for proper color space
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        
+        VkResult result = vkCreateImage(m_compositorDevice, &imageInfo, nullptr, &m_copiedMenuTexture);
+        if (result != VK_SUCCESS) {
+            Logger::err(str::format("VRCompositor: Failed to create copied menu texture - error: ", result));
+            return false;
+        }
+        
+        // Allocate memory for the copied texture
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(m_compositorDevice, m_copiedMenuTexture, &memRequirements);
+        
+        VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        
+        result = vkAllocateMemory(m_compositorDevice, &allocInfo, nullptr, &m_copiedMenuTextureMemory);
+        if (result != VK_SUCCESS) {
+            Logger::err(str::format("VRCompositor: Failed to allocate copied menu texture memory - error: ", result));
+            vkDestroyImage(m_compositorDevice, m_copiedMenuTexture, nullptr);
+            m_copiedMenuTexture = VK_NULL_HANDLE;
+            return false;
+        }
+        
+        vkBindImageMemory(m_compositorDevice, m_copiedMenuTexture, m_copiedMenuTextureMemory, 0);
+        
+        // Create image view for the copied texture
+        VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        viewInfo.image = m_copiedMenuTexture;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_B8G8R8A8_SRGB;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        
+        result = vkCreateImageView(m_compositorDevice, &viewInfo, nullptr, &m_copiedMenuTextureView);
+        if (result != VK_SUCCESS) {
+            Logger::err(str::format("VRCompositor: Failed to create copied menu texture view - error: ", result));
+            vkDestroyImage(m_compositorDevice, m_copiedMenuTexture, nullptr);
+            vkFreeMemory(m_compositorDevice, m_copiedMenuTextureMemory, nullptr);
+            m_copiedMenuTexture = VK_NULL_HANDLE;
+            m_copiedMenuTextureMemory = VK_NULL_HANDLE;
+            return false;
+        }
+        
+        m_copiedTextureWidth = width;
+        m_copiedTextureHeight = height;
+        
+        Logger::info(str::format("VRCompositor: ✅ Created copied menu texture ", width, "x", height));
+    }
+    
+    // CRITICAL: Add memory barriers and synchronization to ensure source texture is fully written
+    // We need to make sure TF2 has finished writing to the source texture before we copy from it
+    
+    // Wait for any pending operations on the compositor queue to complete
+    vkQueueWaitIdle(m_compositorQueue);
+    
+    // Now perform the actual texture copy using a command buffer
+    // Create command buffer for the copy operation
+    VkCommandBufferAllocateInfo cmdAllocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAllocInfo.commandPool = m_compositorCommandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    
+    VkCommandBuffer cmdBuffer;
+    VkResult result = vkAllocateCommandBuffers(m_compositorDevice, &cmdAllocInfo, &cmdBuffer);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate copy command buffer - error: ", result));
+        return false;
+    }
+    
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    
+    vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+    
+    // CRITICAL: Ensure source texture is fully written and ready for reading
+    // Add a comprehensive barrier that waits for ALL possible write operations to complete
+    VkImageMemoryBarrier srcBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    srcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL; // More permissive - source could be in various states
+    srcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    srcBarrier.image = sourceTexture;
+    srcBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    srcBarrier.subresourceRange.baseMipLevel = 0;
+    srcBarrier.subresourceRange.levelCount = 1;
+    srcBarrier.subresourceRange.baseArrayLayer = 0;
+    srcBarrier.subresourceRange.layerCount = 1;
+    // CRITICAL: Wait for ALL possible write operations (color attachment, shader writes, etc.)
+    srcBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | 
+                              VK_ACCESS_SHADER_WRITE_BIT | 
+                              VK_ACCESS_TRANSFER_WRITE_BIT |
+                              VK_ACCESS_MEMORY_WRITE_BIT;
+    srcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    
+    // Transition destination image to transfer dst optimal
+    VkImageMemoryBarrier dstBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    dstBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    dstBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    dstBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBarrier.image = m_copiedMenuTexture;
+    dstBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    dstBarrier.subresourceRange.baseMipLevel = 0;
+    dstBarrier.subresourceRange.levelCount = 1;
+    dstBarrier.subresourceRange.baseArrayLayer = 0;
+    dstBarrier.subresourceRange.layerCount = 1;
+    dstBarrier.srcAccessMask = 0;
+    dstBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    
+    VkImageMemoryBarrier barriers[] = { srcBarrier, dstBarrier };
+    
+    // CRITICAL: Wait for ALL pipeline stages that could be writing to the source texture
+    vkCmdPipelineBarrier(cmdBuffer, 
+                        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 0, nullptr, 0, nullptr, 2, barriers);
+    
+    // Copy the image
+    VkImageCopy copyRegion = {};
+    copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.srcSubresource.mipLevel = 0;
+    copyRegion.srcSubresource.baseArrayLayer = 0;
+    copyRegion.srcSubresource.layerCount = 1;
+    copyRegion.srcOffset = {0, 0, 0};
+    copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.dstSubresource.mipLevel = 0;
+    copyRegion.dstSubresource.baseArrayLayer = 0;
+    copyRegion.dstSubresource.layerCount = 1;
+    copyRegion.dstOffset = {0, 0, 0};
+    copyRegion.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+    
+    vkCmdCopyImage(cmdBuffer, sourceTexture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   m_copiedMenuTexture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+    
+    // Transition destination image to shader read only optimal for sampling
+    VkImageMemoryBarrier finalBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    finalBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    finalBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    finalBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finalBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finalBarrier.image = m_copiedMenuTexture;
+    finalBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    finalBarrier.subresourceRange.baseMipLevel = 0;
+    finalBarrier.subresourceRange.levelCount = 1;
+    finalBarrier.subresourceRange.baseArrayLayer = 0;
+    finalBarrier.subresourceRange.layerCount = 1;
+    finalBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    finalBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    
+    vkCmdPipelineBarrier(cmdBuffer, 
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &finalBarrier);
+    
+    vkEndCommandBuffer(cmdBuffer);
+    
+    // CRITICAL: Use a fence to ensure atomic completion and prevent race conditions
+    VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence copyFence;
+    result = vkCreateFence(m_compositorDevice, &fenceInfo, nullptr, &copyFence);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create copy fence - error: ", result));
+        vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
+        return false;
+    }
+    
+    // Submit the copy command with fence
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmdBuffer;
+    
+    result = vkQueueSubmit(m_compositorQueue, 1, &submitInfo, copyFence);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to submit copy command - error: ", result));
+        vkDestroyFence(m_compositorDevice, copyFence, nullptr);
+        vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
+        return false;
+    }
+    
+    // CRITICAL: Wait for the fence to guarantee copy completion before proceeding
+    result = vkWaitForFences(m_compositorDevice, 1, &copyFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to wait for copy fence - error: ", result));
+    }
+    
+    // Clean up fence
+    vkDestroyFence(m_compositorDevice, copyFence, nullptr);
+    
+    // Clean up command buffer
+    vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
+    
+    // Mark that we have successfully copied the menu texture
+    m_menuTextureCopied = true;
+    
+    Logger::info("VRCompositor: ✅ VGUI texture copied successfully - will be used for rendering!");
+    Logger::info(str::format("VRCompositor: 🔍 Debug - m_menuTextureCopied set to true, m_copiedMenuTextureView: ", (void*)m_copiedMenuTextureView));
     return true;
 }
 
@@ -676,7 +914,14 @@ bool VRCompositor::CreateVulkanPipeline() {
     
     VkPipelineColorBlendAttachmentState colorBlendAttachment = {};
     colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    colorBlendAttachment.blendEnable = VK_TRUE;
+    // Standard alpha blending for UI transparency
+    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
     
     VkPipelineColorBlendStateCreateInfo colorBlending = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     colorBlending.logicOpEnable = VK_FALSE;
@@ -714,27 +959,30 @@ bool VRCompositor::CreateVulkanPipeline() {
 }
 
 bool VRCompositor::CreateVertexBuffer() {
-    Logger::info("VRCompositor: Creating simple vertex buffer with position-only data...");
+    Logger::info("VRCompositor: Creating vertex buffer with full QuadVertex data...");
     
-    // Simple quad vertices (2 triangles = 6 vertices, 3 floats each = position only)
+    // 16:9 aspect ratio quad vertices (2 triangles = 6 vertices, QuadVertex each)
     // Fixed to be COUNTER-CLOCKWISE winding for proper front-facing triangles
     // Positioned at eye level (OpenXR origin is typically at floor, so lift quad up)
     float eyeLevelOffset = 0.8f;  // Lift to typical seated eye height (~80cm)
-    float simpleQuadVertices[] = {
-        // Triangle 1 (counter-clockwise) - positioned at current eye level
-        -0.5f, -0.5f - eyeLevelOffset, -1.0f,  // Bottom-left
-         0.5f,  0.5f - eyeLevelOffset, -1.0f,  // Top-right
-         0.5f, -0.5f - eyeLevelOffset, -1.0f,  // Bottom-right
+    float halfWidth = 1.0f;       // 2m total width (16 units)
+    float halfHeight = 0.5625f;   // 1.125m total height (9 units) = 16:9 ratio
+    
+    QuadVertex quadVertices[6] = {
+        // Triangle 1 (counter-clockwise) - Flipped texture coordinates for correct orientation
+        { {-halfWidth, -halfHeight - eyeLevelOffset, -1.0f}, {0.0f, 0.0f}, {1.0f, 1.0f, 1.0f} }, // Bottom-left
+        { { halfWidth,  halfHeight - eyeLevelOffset, -1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f, 1.0f} }, // Top-right
+        { { halfWidth, -halfHeight - eyeLevelOffset, -1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f, 1.0f} }, // Bottom-right
         
-        // Triangle 2 (counter-clockwise)
-        -0.5f, -0.5f - eyeLevelOffset, -1.0f,  // Bottom-left
-        -0.5f,  0.5f - eyeLevelOffset, -1.0f,  // Top-left
-         0.5f,  0.5f - eyeLevelOffset, -1.0f   // Top-right
+        // Triangle 2 (counter-clockwise) - Flipped texture coordinates for correct orientation
+        { {-halfWidth, -halfHeight - eyeLevelOffset, -1.0f}, {0.0f, 0.0f}, {1.0f, 1.0f, 1.0f} }, // Bottom-left
+        { {-halfWidth,  halfHeight - eyeLevelOffset, -1.0f}, {0.0f, 1.0f}, {1.0f, 1.0f, 1.0f} }, // Top-left
+        { { halfWidth,  halfHeight - eyeLevelOffset, -1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f, 1.0f} }  // Top-right
     };
     
-    Logger::info(str::format("VRCompositor: Quad positioned at eye level (offset: ", eyeLevelOffset, "m)"));
+    Logger::info(str::format("VRCompositor: Quad positioned at eye level (offset: ", eyeLevelOffset, "m) with texture coordinates"));
     
-    VkDeviceSize bufferSize = sizeof(simpleQuadVertices);
+    VkDeviceSize bufferSize = sizeof(quadVertices);
     
     // Create vertex buffer
     VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -766,10 +1014,10 @@ bool VRCompositor::CreateVertexBuffer() {
     
     void* data;
     vkMapMemory(m_compositorDevice, m_vertexBufferMemory, 0, bufferSize, 0, &data);
-    memcpy(data, simpleQuadVertices, (size_t)bufferSize);
+    memcpy(data, quadVertices, (size_t)bufferSize);
     vkUnmapMemory(m_compositorDevice, m_vertexBufferMemory);
     
-    Logger::info("VRCompositor: ✅ Simple vertex buffer created - 6 vertices, position-only");
+    Logger::info("VRCompositor: ✅ Vertex buffer created - 6 vertices with position, texture coords, and color");
     return true;
 }
 
@@ -1252,9 +1500,12 @@ void VRCompositor::CompositorThreadFunc() {
     Logger::info("VRCompositor: 🧵 Compositor thread started");
     
     while (!m_shouldStop.load()) {
+        // Check for and copy VGUI textures (safe polling)
+        ::CheckAndCopyTrackedVGUITexture();
+        
         if (!RunIndependentFrame()) {
-            Logger::warn("VRCompositor: Independent frame failed, sleeping");
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            Logger::warn("VRCompositor: Independent frame failed, minimal sleep");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));  // Minimal delay for responsiveness
         }
     }
     
@@ -1264,8 +1515,8 @@ void VRCompositor::CompositorThreadFunc() {
 void VRCompositor::SetupQuadVertices() {
     // Create a quad positioned 2.5 meters in front of the user
     // Size: 2m wide x 1.125m tall (16:9 aspect ratio)
-    float halfWidth = 1.0f;   // 2m wide
-    float halfHeight = 0.5625f; // 1.125m tall
+    float halfWidth = 1.0f;   // 2m wide (16 units)
+    float halfHeight = 0.5625f; // 1.125m tall (9 units) = 16:9 ratio
     float distance = -2.5f;   // 2.5m in front (negative Z)
     
     // Bottom-left
@@ -1273,9 +1524,9 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[0].position[1] = -halfHeight;
     m_quadVertices[0].position[2] = distance;
     m_quadVertices[0].texCoord[0] = 0.0f;
-    m_quadVertices[0].texCoord[1] = 1.0f; // Flip Y for Vulkan
-    m_quadVertices[0].color[0] = 1.0f; // Bright cyan
-    m_quadVertices[0].color[1] = 0.0f;
+    m_quadVertices[0].texCoord[1] = 0.0f; // Fixed: Bottom should be 0.0f, not 1.0f
+    m_quadVertices[0].color[0] = 1.0f; // White for proper texture rendering
+    m_quadVertices[0].color[1] = 1.0f;
     m_quadVertices[0].color[2] = 1.0f;
     
     // Bottom-right
@@ -1283,9 +1534,9 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[1].position[1] = -halfHeight;
     m_quadVertices[1].position[2] = distance;
     m_quadVertices[1].texCoord[0] = 1.0f;
-    m_quadVertices[1].texCoord[1] = 1.0f;
+    m_quadVertices[1].texCoord[1] = 0.0f; // Fixed: Bottom should be 0.0f, not 1.0f
     m_quadVertices[1].color[0] = 1.0f;
-    m_quadVertices[1].color[1] = 0.0f;
+    m_quadVertices[1].color[1] = 1.0f;
     m_quadVertices[1].color[2] = 1.0f;
     
     // Top-right
@@ -1293,9 +1544,9 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[2].position[1] = halfHeight;
     m_quadVertices[2].position[2] = distance;
     m_quadVertices[2].texCoord[0] = 1.0f;
-    m_quadVertices[2].texCoord[1] = 0.0f;
+    m_quadVertices[2].texCoord[1] = 1.0f; // Fixed: Top should be 1.0f, not 0.0f
     m_quadVertices[2].color[0] = 1.0f;
-    m_quadVertices[2].color[1] = 0.0f;
+    m_quadVertices[2].color[1] = 1.0f;
     m_quadVertices[2].color[2] = 1.0f;
     
     // Top-left
@@ -1303,12 +1554,12 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[3].position[1] = halfHeight;
     m_quadVertices[3].position[2] = distance;
     m_quadVertices[3].texCoord[0] = 0.0f;
-    m_quadVertices[3].texCoord[1] = 0.0f;
+    m_quadVertices[3].texCoord[1] = 1.0f; // Fixed: Top should be 1.0f, not 0.0f
     m_quadVertices[3].color[0] = 1.0f;
-    m_quadVertices[3].color[1] = 0.0f;
+    m_quadVertices[3].color[1] = 1.0f;
     m_quadVertices[3].color[2] = 1.0f;
     
-    Logger::info("VRCompositor: ✅ Quad vertices set up - cyan 2x1.125m quad at 2.5m distance");
+    Logger::info("VRCompositor: ✅ Quad vertices set up - white 2x1.125m quad (16:9) at 2.5m distance");
 }
 
 void VRCompositor::SetupMVPMatrix() {
@@ -1334,6 +1585,8 @@ bool VRCompositor::RunIndependentFrame() {
     if (frameCount == 1) {
         Logger::info("VRCompositor: 🧵 First RunIndependentFrame called - thread is running!");
     }
+    
+    // SIMPLE APPROACH: No complex synchronization - let systems run independently
     
     if (!m_pOpenXRManager) {
         Logger::warn("VRCompositor: RunIndependentFrame failed - no OpenXR manager");
@@ -1368,6 +1621,9 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
+    // PRESENT-DRIVEN: Don't pull textures here - let TF2's present completion push them
+    // This avoids capturing textures mid-construction
+    
     // Use RenderFrame instead of calling RenderEye directly
     std::vector<XrCompositionLayerBaseHeader*> layers;
     bool rendered = RenderFrame(frameState, layers);
@@ -1385,17 +1641,20 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
+    Logger::info("VRCompositor: ✅ Frame rendered successfully");
     return true;
 }
 
 bool VRCompositor::CreateSimple3DQuad() {
     Logger::info("VRCompositor: Creating simple 3D quad with basic pipeline...");
     
-    // Set up simple quad vertices (2m wide x 1.125m tall, 2.5m away)
-    m_quadVertices[0] = {{-1.0f, -0.5625f, -2.5f}, {0.0f, 1.0f}, {0.0f, 1.0f, 1.0f}}; // Bottom-left
-    m_quadVertices[1] = {{ 1.0f, -0.5625f, -2.5f}, {1.0f, 1.0f}, {0.0f, 1.0f, 1.0f}}; // Bottom-right  
-    m_quadVertices[2] = {{ 1.0f,  0.5625f, -2.5f}, {1.0f, 0.0f}, {0.0f, 1.0f, 1.0f}}; // Top-right
-    m_quadVertices[3] = {{-1.0f,  0.5625f, -2.5f}, {0.0f, 0.0f}, {0.0f, 1.0f, 1.0f}}; // Top-left
+    // Set up 16:9 aspect ratio quad vertices (2m wide x 1.125m tall, 2.5m away)
+    float halfWidth = 1.0f;        // 2m total width (16 units)
+    float halfHeight = 0.5625f;    // 1.125m total height (9 units) = 16:9 ratio
+    m_quadVertices[0] = {{-halfWidth, -halfHeight, -2.5f}, {0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}}; // Bottom-left
+    m_quadVertices[1] = {{ halfWidth, -halfHeight, -2.5f}, {1.0f, 0.0f}, {1.0f, 1.0f, 1.0f}}; // Bottom-right  
+    m_quadVertices[2] = {{ halfWidth,  halfHeight, -2.5f}, {1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}}; // Top-right
+    m_quadVertices[3] = {{-halfWidth,  halfHeight, -2.5f}, {0.0f, 1.0f}, {1.0f, 1.0f, 1.0f}}; // Top-left
     
     // Try to create a working 3D pipeline using a simpler approach
     if (CreateWorkingVulkanPipeline()) {
@@ -1460,7 +1719,7 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
     renderPassInfo.renderArea.extent = { swapchainWidth, swapchainHeight };
     
     VkClearValue clearColor = {};
-    clearColor.color = { { 1.0f, 0.0f, 1.0f, 1.0f } }; // Bright magenta background to test render pass
+    clearColor.color = { { 0.0f, 0.0f, 0.02094f, 1.0f } };
     renderPassInfo.clearValueCount = 1;
     renderPassInfo.pClearValues = &clearColor;
     
@@ -1502,6 +1761,60 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
     // Push MVP matrix as push constant
     const size_t mvpMatrixSize = 16 * sizeof(float); // 4x4 matrix = 64 bytes
     vkCmdPushConstants(m_compositorCommandBuffer, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, mvpMatrixSize, mvpMatrix);
+    
+    // AGGRESSIVE ANTI-FLICKER: Once we get ANY VGUI texture, never go back to fallback
+    static VkImageView persistentVGUITexture = VK_NULL_HANDLE;
+    static bool everHadVGUI = false;
+    static int debugFrameCount = 0;
+    debugFrameCount++;
+    
+    VkImageView textureToUse = m_fallbackTextureView;
+    
+    // Debug current state every frame for a few seconds to understand the flickering
+    if (debugFrameCount < 300) { // Debug for first 5 seconds at 60fps
+        if (debugFrameCount % 30 == 1) { // Every 0.5 seconds
+            Logger::info(str::format("VRCompositor: DEBUG Eye ", eye, " frame ", debugFrameCount, 
+                                    " - m_copiedMenuTextureView: ", (void*)m_copiedMenuTextureView, 
+                                    " m_menuTextureCopied: ", m_menuTextureCopied ? "true" : "false",
+                                    " persistentVGUITexture: ", (void*)persistentVGUITexture));
+        }
+    }
+    
+    // Check if we have a current VGUI texture available
+    bool hasCurrentVGUITexture = (m_copiedMenuTextureView != VK_NULL_HANDLE && m_menuTextureCopied);
+    
+    if (hasCurrentVGUITexture) {
+        // Use current VGUI texture and cache it persistently
+        textureToUse = m_copiedMenuTextureView;
+        persistentVGUITexture = m_copiedMenuTextureView;  // Cache it
+        everHadVGUI = true;
+        
+        static int currentFrameCount = 0;
+        if ((++currentFrameCount % 300) == 1) {
+            Logger::info(str::format("VRCompositor: Eye ", eye, " - Using CURRENT VGUI texture (frame #", currentFrameCount, ")"));
+        }
+    } else if (everHadVGUI && persistentVGUITexture != VK_NULL_HANDLE) {
+        // CRITICAL: Always use cached VGUI texture once we've had one (prevents flicker)
+        textureToUse = persistentVGUITexture;
+        
+        static int persistentFrameCount = 0;
+        if ((++persistentFrameCount % 120) == 1) {
+            Logger::info(str::format("VRCompositor: Eye ", eye, " - Using PERSISTENT VGUI texture to prevent flicker (frame #", persistentFrameCount, ")"));
+        }
+    } else {
+        // Only use fallback if we've NEVER had a VGUI texture
+        static int fallbackFrameCount = 0;
+        if ((++fallbackFrameCount % 60) == 1) {
+            Logger::info(str::format("VRCompositor: Eye ", eye, " - Using FALLBACK texture (waiting for first VGUI) (frame #", fallbackFrameCount, ")"));
+        }
+    }
+    
+    // Update descriptor set for this frame
+    UpdateDescriptorSetWithTexture(textureToUse);
+    
+    // Bind descriptor set for texture sampling
+    vkCmdBindDescriptorSets(m_compositorCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, 
+                           m_pipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr);
     
     // Bind vertex buffer
     VkBuffer vertexBuffers[] = { m_vertexBuffer };
@@ -1598,6 +1911,24 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
         return false;
     }
     
+    // Create texture sampler
+    if (!CreateTextureSampler()) {
+        Logger::err("VRCompositor: Failed to create texture sampler");
+        return false;
+    }
+    
+    // Create descriptor resources for texture binding
+    if (!CreateDescriptorResources()) {
+        Logger::err("VRCompositor: Failed to create descriptor resources");
+        return false;
+    }
+    
+    // Create fallback texture if not already created
+    if (!CreateSimpleFallbackTexture()) {
+        Logger::err("VRCompositor: Failed to create fallback texture");
+        return false;
+    }
+    
     // Create pipeline layout with push constants for MVP matrix
     VkPushConstantRange pushConstantRange = {};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1605,6 +1936,8 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
     pushConstantRange.size = sizeof(float) * 16; // 4x4 matrix
     
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
     pipelineLayoutInfo.pushConstantRangeCount = 1;
     pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
     
@@ -1627,23 +1960,37 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
     
     VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
     
-    // Vertex input
+    // Vertex input - position, texture coordinates, and color
     VkVertexInputBindingDescription bindingDescription = {};
     bindingDescription.binding = 0;
-    bindingDescription.stride = sizeof(float) * 3; // 3 floats per vertex (x, y, z)
+    bindingDescription.stride = sizeof(QuadVertex); // Full QuadVertex structure
     bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
     
-    VkVertexInputAttributeDescription attributeDescription = {};
-    attributeDescription.binding = 0;
-    attributeDescription.location = 0;
-    attributeDescription.format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributeDescription.offset = 0;
+    VkVertexInputAttributeDescription attributeDescriptions[3] = {};
+    
+    // Position (location = 0)
+    attributeDescriptions[0].binding = 0;
+    attributeDescriptions[0].location = 0;
+    attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributeDescriptions[0].offset = offsetof(QuadVertex, position);
+    
+    // Texture coordinates (location = 1)
+    attributeDescriptions[1].binding = 0;
+    attributeDescriptions[1].location = 1;
+    attributeDescriptions[1].format = VK_FORMAT_R32G32_SFLOAT;
+    attributeDescriptions[1].offset = offsetof(QuadVertex, texCoord);
+    
+    // Color (location = 2)
+    attributeDescriptions[2].binding = 0;
+    attributeDescriptions[2].location = 2;
+    attributeDescriptions[2].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributeDescriptions[2].offset = offsetof(QuadVertex, color);
     
     VkPipelineVertexInputStateCreateInfo vertexInputInfo = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     vertexInputInfo.vertexBindingDescriptionCount = 1;
     vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
-    vertexInputInfo.vertexAttributeDescriptionCount = 1;
-    vertexInputInfo.pVertexAttributeDescriptions = &attributeDescription;
+    vertexInputInfo.vertexAttributeDescriptionCount = 3;
+    vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions;
     
     // Input assembly
     VkPipelineInputAssemblyStateCreateInfo inputAssembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
@@ -1670,10 +2017,17 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
     multisampling.sampleShadingEnable = VK_FALSE;
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     
-    // Color blending
+    // Color blending - Enable alpha blending for proper UI transparency
     VkPipelineColorBlendAttachmentState colorBlendAttachment = {};
     colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    colorBlendAttachment.blendEnable = VK_TRUE;
+    // Standard alpha blending: (srcColor * srcAlpha) + (dstColor * (1 - srcAlpha))
+    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
     
     VkPipelineColorBlendStateCreateInfo colorBlending = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     colorBlending.logicOpEnable = VK_FALSE;
@@ -1709,6 +2063,330 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
     
     Logger::info("VRCompositor: ✅ Successfully created working Vulkan pipeline!");
     return true;
+}
+
+bool VRCompositor::CreateTextureSampler() {
+    Logger::info("VRCompositor: Creating texture sampler...");
+    
+    VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    
+    VkResult result = vkCreateSampler(m_compositorDevice, &samplerInfo, nullptr, &m_textureSampler);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create texture sampler - error: ", result));
+        return false;
+    }
+    
+    Logger::info("VRCompositor: ✅ Texture sampler created successfully");
+    return true;
+}
+
+bool VRCompositor::CreateDescriptorResources() {
+    Logger::info("VRCompositor: Creating descriptor resources...");
+    
+    // Create descriptor set layout
+    VkDescriptorSetLayoutBinding samplerLayoutBinding = {};
+    samplerLayoutBinding.binding = 0;
+    samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    samplerLayoutBinding.descriptorCount = 1;
+    samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    samplerLayoutBinding.pImmutableSamplers = nullptr;
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &samplerLayoutBinding;
+    
+    VkResult result = vkCreateDescriptorSetLayout(m_compositorDevice, &layoutInfo, nullptr, &m_descriptorSetLayout);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create descriptor set layout - error: ", result));
+        return false;
+    }
+    
+    // Create descriptor pool
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSize.descriptorCount = 1;
+    
+    VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = 1;
+    
+    result = vkCreateDescriptorPool(m_compositorDevice, &poolInfo, nullptr, &m_descriptorPool);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create descriptor pool - error: ", result));
+        return false;
+    }
+    
+    // Allocate descriptor set
+    VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_descriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_descriptorSetLayout;
+    
+    result = vkAllocateDescriptorSets(m_compositorDevice, &allocInfo, &m_descriptorSet);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate descriptor set - error: ", result));
+        return false;
+    }
+    
+    Logger::info("VRCompositor: ✅ Descriptor resources created successfully");
+    return true;
+}
+
+bool VRCompositor::CreateSimpleFallbackTexture() {
+    Logger::info("VRCompositor: Creating simple fallback texture...");
+    
+    // Create a simple 2x2 bright green texture as fallback (visible on magenta background)
+    const uint32_t texWidth = 2;
+    const uint32_t texHeight = 2;
+    const uint32_t texChannels = 4; // RGBA
+    
+    // Bright green texture data (2x2 pixels, RGBA format) - contrasts with magenta background
+    uint8_t textureData[] = {
+        0, 255, 0, 255,    // Bright green
+        0, 255, 0, 255,    // Bright green
+        0, 255, 0, 255,    // Bright green
+        0, 255, 0, 255     // Bright green
+    };
+    
+    VkDeviceSize imageSize = texWidth * texHeight * texChannels;
+    
+    // Create staging buffer first to upload texture data
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingBufferMemory;
+    
+    VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.size = imageSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    VkResult result = vkCreateBuffer(m_compositorDevice, &bufferInfo, nullptr, &stagingBuffer);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create staging buffer - error: ", result));
+        return false;
+    }
+    
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(m_compositorDevice, stagingBuffer, &memRequirements);
+    
+    VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    result = vkAllocateMemory(m_compositorDevice, &allocInfo, nullptr, &stagingBufferMemory);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate staging buffer memory - error: ", result));
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        return false;
+    }
+    
+    vkBindBufferMemory(m_compositorDevice, stagingBuffer, stagingBufferMemory, 0);
+    
+    // Upload texture data to staging buffer
+    void* data;
+    vkMapMemory(m_compositorDevice, stagingBufferMemory, 0, imageSize, 0, &data);
+    memcpy(data, textureData, static_cast<size_t>(imageSize));
+    vkUnmapMemory(m_compositorDevice, stagingBufferMemory);
+    
+    // Create image
+    VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = texWidth;
+    imageInfo.extent.height = texHeight;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    result = vkCreateImage(m_compositorDevice, &imageInfo, nullptr, &m_fallbackTexture);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create fallback texture image - error: ", result));
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+        return false;
+    }
+    
+    // Allocate image memory
+    vkGetImageMemoryRequirements(m_compositorDevice, m_fallbackTexture, &memRequirements);
+    
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    result = vkAllocateMemory(m_compositorDevice, &allocInfo, nullptr, &m_fallbackTextureMemory);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate fallback texture memory - error: ", result));
+        vkDestroyImage(m_compositorDevice, m_fallbackTexture, nullptr);
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+        return false;
+    }
+    
+    vkBindImageMemory(m_compositorDevice, m_fallbackTexture, m_fallbackTextureMemory, 0);
+    
+    // Create command buffer for image layout transitions and buffer copy
+    VkCommandBufferAllocateInfo cmdAllocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAllocInfo.commandPool = m_compositorCommandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    
+    VkCommandBuffer cmdBuffer;
+    result = vkAllocateCommandBuffers(m_compositorDevice, &cmdAllocInfo, &cmdBuffer);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate command buffer - error: ", result));
+        vkDestroyImage(m_compositorDevice, m_fallbackTexture, nullptr);
+        vkFreeMemory(m_compositorDevice, m_fallbackTextureMemory, nullptr);
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+        return false;
+    }
+    
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    
+    vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+    
+    // Transition image layout from undefined to transfer dst optimal
+    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_fallbackTexture;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    
+    vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &barrier);
+    
+    // Copy buffer to image
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {texWidth, texHeight, 1};
+    
+    vkCmdCopyBufferToImage(cmdBuffer, stagingBuffer, m_fallbackTexture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    
+    // Transition image layout from transfer dst optimal to shader read only optimal
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    
+    vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &barrier);
+    
+    vkEndCommandBuffer(cmdBuffer);
+    
+    // Submit command buffer
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmdBuffer;
+    
+    result = vkQueueSubmit(m_compositorQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to submit command buffer - error: ", result));
+    }
+    
+    vkQueueWaitIdle(m_compositorQueue);
+    
+    // Clean up staging resources
+    vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
+    vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+    vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+    
+    // Create image view
+    VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    viewInfo.image = m_fallbackTexture;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+    
+    result = vkCreateImageView(m_compositorDevice, &viewInfo, nullptr, &m_fallbackTextureView);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create fallback texture view - error: ", result));
+        return false;
+    }
+    
+    // Update descriptor set to use the fallback texture
+    VkDescriptorImageInfo imageInfo2 = {};
+    imageInfo2.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfo2.imageView = m_fallbackTextureView;
+    imageInfo2.sampler = m_textureSampler;
+    
+    VkWriteDescriptorSet descriptorWrite = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    descriptorWrite.dstSet = m_descriptorSet;
+    descriptorWrite.dstBinding = 0;
+    descriptorWrite.dstArrayElement = 0;
+    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrite.descriptorCount = 1;
+    descriptorWrite.pImageInfo = &imageInfo2;
+    
+    vkUpdateDescriptorSets(m_compositorDevice, 1, &descriptorWrite, 0, nullptr);
+    
+    Logger::info("VRCompositor: ✅ Bright green fallback texture created with proper data upload and descriptor set updated");
+    return true;
+}
+
+void VRCompositor::UpdateDescriptorSetWithTexture(VkImageView textureView) {
+    if (textureView == VK_NULL_HANDLE) {
+        Logger::warn("VRCompositor: Cannot update descriptor set with null texture view");
+        return;
+    }
+    
+    // Update descriptor set to use the specified texture
+    VkDescriptorImageInfo imageInfo = {};
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfo.imageView = textureView;
+    imageInfo.sampler = m_textureSampler;
+    
+    VkWriteDescriptorSet descriptorWrite = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    descriptorWrite.dstSet = m_descriptorSet;
+    descriptorWrite.dstBinding = 0;
+    descriptorWrite.dstArrayElement = 0;
+    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrite.descriptorCount = 1;
+    descriptorWrite.pImageInfo = &imageInfo;
+    
+    vkUpdateDescriptorSets(m_compositorDevice, 1, &descriptorWrite, 0, nullptr);
+    
+    Logger::info("VRCompositor: ✅ Descriptor set updated with new texture");
 }
 
 } // namespace dxvk

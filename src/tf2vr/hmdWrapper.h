@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openxr/openxr.h"
+#include <mutex>
 
 // Note: SourceEngineState enum moved to VRCompositor.h to avoid circular dependencies
 
@@ -20,3 +21,14 @@ extern "C" void __declspec(dllexport) dxvkSubmitMenuFrame(void* textureHandle, i
 // VR Compositor Internal Functions (not exported, but declared for linking)
 void InitVRCompositor(class OpenXRDirectMode* manager);
 bool IsVRCompositorActive();  // Internal version (calls the implementation directly)
+void CheckAndCopyTrackedVGUITexture();  // Internal texture copying function
+std::timed_mutex* GetPresentSyncMutex();  // Synchronization mutex for atomic texture copying
+
+// Simple single-mutex blocking approach
+
+// VGUI Rendering Completion Hooks (for perfect texture capture timing)
+extern "C" void __declspec(dllexport) TF2VR_NotifyVGUIPaintComplete();  // Called right after VGui_Paint() completes
+extern "C" void __declspec(dllexport) TF2VR_NotifyVGUIPresentComplete();  // Called right after vkQueuePresentKHR() completes
+
+// Compositor-Controlled Synchronization (mirrors OpenXR BeginFrame pattern)
+extern "C" void __declspec(dllexport) TF2VR_CompositorBeginTextureSync();  // Called by VR compositor to request texture sync

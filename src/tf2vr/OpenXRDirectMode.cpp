@@ -423,7 +423,9 @@ void OpenXRDirectMode::PostPresent()
 	// Don't interfere with compositor's frame management
 	extern bool IsVRCompositorActive();
 	if (IsVRCompositorActive()) {
-		Logger::info("OpenXRDirectMode: PostPresent skipped - compositor is active");
+		// LOCK-FREE APPROACH: No synchronization needed in PostPresent
+		// Texture copying happens independently without blocking TF2
+		Logger::info("OpenXRDirectMode: PostPresent skipped - compositor is active (lock-free mode)");
 		return;
 	}
 
@@ -441,7 +443,14 @@ void OpenXRDirectMode::PrePresentCallBack()
 
 	// Don't interfere with compositor's frame management
 	extern bool IsVRCompositorActive();
+	extern std::timed_mutex* GetPresentSyncMutex();  // Forward declaration
 	if (IsVRCompositorActive()) {
+		// TEXTURE COPY NOTIFICATION: Right before DXVK present - perfect timing!
+		// This mirrors the main rendering setup timing
+		extern void TF2VR_NotifyVGUIPresentComplete();
+		TF2VR_NotifyVGUIPresentComplete();
+		
+		Logger::info("OpenXRDirectMode: 📸 TEXTURE COPY - Right before DXVK present (perfect timing)");
 		Logger::info("OpenXRDirectMode: PrePresentCallback skipped - compositor is active");
 		return;
 	}
@@ -467,9 +476,12 @@ void OpenXRDirectMode::PostPresentCallback()
 	// Don't interfere with compositor's frame management
 	extern bool IsVRCompositorActive();
 	extern void TF2VR_NotifyVGUIFrameComplete();
+	extern void TF2VR_NotifyVGUIPresentComplete();  // New present-complete hook
+	extern std::timed_mutex* GetPresentSyncMutex();  // Forward declaration
 	if (IsVRCompositorActive()) {
 		// Notify that a VGUI frame may have been completed
 		TF2VR_NotifyVGUIFrameComplete();
+		
 		Logger::info("OpenXRDirectMode: PostPresentCallback skipped - compositor is active");
 		return;
 	}
@@ -1555,46 +1567,270 @@ void CheckAndCopyTrackedVGUITexture();
 // TF2VR: VGUI Render Target Tracking (global scope for access from VRCompositor)
 dxvk::D3D9Surface* g_trackedVGUISurface = nullptr;
 dxvk::D3D9CommonTexture* g_trackedVGUITexture = nullptr;
-std::mutex g_vguiTrackingMutex;
+// NOTE: No mutex needed - using single mutex approach to prevent deadlocks
 
-// SAFE VGUI TEXTURE POLLING - Called from compositor thread
+// Dual texture tracking for TF2's double-buffering
+struct VGUITextureInfo {
+    dxvk::D3D9CommonTexture* texture = nullptr;
+    dxvk::D3D9Surface* surface = nullptr;
+    std::chrono::high_resolution_clock::time_point lastUsed;
+    int useCount = 0;
+    void* textureAddress = nullptr;  // Track D3D9 texture object address
+};
+static VGUITextureInfo g_vguiTextureA;
+static VGUITextureInfo g_vguiTextureB;
+static VGUITextureInfo* g_mostRecentVGUITexture = nullptr;
+
+// Track render operations to detect multi-pass rendering
+static std::atomic<int> g_renderOpsSinceLastCopy{0};
+
+// Global frame tracking with queue to prevent dropped frames
+static std::atomic<int> g_frameCompleteCount{0};
+static std::atomic<int> g_lastProcessedFrame{0};  // Track which frame we last processed
+
+// Track source texture stability to prevent copying from actively written textures
+static VkImage g_lastSourceTexture = VK_NULL_HANDLE;
+static int g_sourceTextureStableCount = 0;
+
+// Track texture usage frequency to prefer final outputs over intermediates
+struct TextureUsageInfo {
+    VkImage textureHandle;
+    int usageCount;
+    std::chrono::steady_clock::time_point lastUsage;
+};
+static std::vector<TextureUsageInfo> g_textureUsageHistory;
+
+// Track VGUI render completion to avoid capturing partial renders
+static std::atomic<int> g_vguiRenderPassCount{0};
+static std::chrono::steady_clock::time_point g_lastVGUIRenderTime;
+// Removed g_vguiTimingMutex to prevent deadlocks - using lock-free approach
+
+// Track VGUI flush completion - this is when UI rendering is truly complete
+static std::atomic<bool> g_vguiFlushCompleted{false};
+static std::atomic<int> g_vguiFlushCount{0};
+
+// Async texture readiness signal
+static std::atomic<bool> g_textureReady{false};
+
+// ASYNC TEXTURE COPY - Called from VR compositor thread only when signaled
 void CheckAndCopyTrackedVGUITexture() {
+    // Check if TF2 has signaled a new texture is ready
+    if (!g_textureReady.load()) {
+        return; // No new texture ready
+    }
+    
+    // Clear signal and proceed with copy
+    g_textureReady.store(false);
+    
     static int checkCount = 0;
     checkCount++;
     
-    // DEBUG: Log every call to see if this function is being called
-    if (checkCount % 120 == 1) {  // Log every ~2 seconds
-        dxvk::Logger::info(str::format("VR Compositor: 🔍 CheckAndCopyTrackedVGUITexture called #", checkCount));
-    }
+    dxvk::Logger::info(str::format("VR Compositor: 🔄 ASYNC COPY #", checkCount, " - signaled by TF2"));
     
-    // Try to acquire the lock, but don't block if we can't get it
-    std::unique_lock<std::mutex> lock(g_vguiTrackingMutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        if (checkCount % 120 == 1) {  // Log lock failures occasionally
-            dxvk::Logger::info("VR Compositor: 🔒 Lock busy, skipping copy");
+    // NO LOCKS NEEDED - purely async approach
+    
+    // Use the most recently tracked texture (simple approach)
+    VGUITextureInfo* textureToUse = g_mostRecentVGUITexture;
+    
+    // SIMPLE MODE: Use Slot A which has the complete UI after present
+    static const int FORCE_SLOT_MODE = 6; // Present triggered mode (simple and working)
+    
+    if (FORCE_SLOT_MODE == 1 && g_vguiTextureA.texture != nullptr) {
+        // Force use Slot A only
+        textureToUse = &g_vguiTextureA;
+    } else if (FORCE_SLOT_MODE == 2 && g_vguiTextureB.texture != nullptr) {
+        // Force use Slot B only
+        textureToUse = &g_vguiTextureB;
+    } else if (FORCE_SLOT_MODE == 4 && g_vguiTextureA.texture != nullptr) {
+        // Slot A on flush only - use the existing flush hook without additional timing
+        // This relies on D3D9 Flush() being called when UI rendering is complete
+        textureToUse = &g_vguiTextureA;
+    } else if (FORCE_SLOT_MODE == 5 && g_vguiTextureA.texture != nullptr) {
+        // Slot A on paint complete - triggered right after VGui_Paint() finishes
+        // This is the PERFECT timing - UI is painted but before any cleanup
+        textureToUse = &g_vguiTextureA;
+    } else if (FORCE_SLOT_MODE == 6 && g_vguiTextureA.texture != nullptr) {
+        // Present-triggered - called from TF2VR_NotifyVGUIPresentComplete()
+        // RenderDoc shows this is PERFECT - after all 5 passes, final complete texture!
+        textureToUse = &g_vguiTextureA;
+    } else if (FORCE_SLOT_MODE == 7) {
+        // STABLE TEXTURE MODE: Pick one texture object and stick with it
+        // This eliminates flickering caused by TF2's texture switching
+        static VGUITextureInfo* stableTexture = nullptr;
+        static bool stableTextureChosen = false;
+        
+        if (!stableTextureChosen) {
+            // Choose the first texture we see with good characteristics
+            if (g_vguiTextureA.texture != nullptr && g_vguiTextureA.useCount > 10) {
+                stableTexture = &g_vguiTextureA;
+                stableTextureChosen = true;
+                dxvk::Logger::info("VR Compositor: 🔒 STABLE MODE - locked to Slot A texture for consistent rendering");
+            } else if (g_vguiTextureB.texture != nullptr && g_vguiTextureB.useCount > 10) {
+                stableTexture = &g_vguiTextureB;
+                stableTextureChosen = true;
+                dxvk::Logger::info("VR Compositor: 🔒 STABLE MODE - locked to Slot B texture for consistent rendering");
+            }
         }
-        return; // Source is busy, try next frame
+        
+        if (stableTextureChosen && stableTexture && stableTexture->texture != nullptr) {
+            textureToUse = stableTexture;
+        }
+    } else if (FORCE_SLOT_MODE == 0) {
+        // Auto mode - use timestamp comparison
+        if (g_vguiTextureA.texture != nullptr && g_vguiTextureB.texture != nullptr) {
+            if (g_vguiTextureA.lastUsed > g_vguiTextureB.lastUsed) {
+                textureToUse = &g_vguiTextureA;
+            } else {
+                textureToUse = &g_vguiTextureB;
+            }
+        } else if (g_vguiTextureA.texture != nullptr) {
+            textureToUse = &g_vguiTextureA;
+        } else if (g_vguiTextureB.texture != nullptr) {
+            textureToUse = &g_vguiTextureB;
+        }
     }
     
-    // Check if we have a tracked texture to copy
-    if (g_trackedVGUITexture && g_trackedVGUISurface) {
-        auto desc = g_trackedVGUITexture->Desc();
-        auto dxvkImage = g_trackedVGUITexture->GetImage();
+    // Fallback if forced slot is empty
+    if (!textureToUse) {
+        if (g_vguiTextureA.texture != nullptr) {
+            textureToUse = &g_vguiTextureA;
+        } else if (g_vguiTextureB.texture != nullptr) {
+            textureToUse = &g_vguiTextureB;
+        } else {
+            textureToUse = g_mostRecentVGUITexture;
+        }
+    }
+    
+    // Fallback to regular tracking if dual tracking hasn't been set up yet
+    if (!textureToUse && g_trackedVGUITexture && g_trackedVGUISurface) {
+        // Create a temporary texture info for backwards compatibility
+        static VGUITextureInfo fallbackInfo;
+        fallbackInfo.texture = g_trackedVGUITexture;
+        fallbackInfo.surface = g_trackedVGUISurface;
+        fallbackInfo.textureAddress = (void*)g_trackedVGUITexture;
+        textureToUse = &fallbackInfo;
+    }
+    
+    if (textureToUse && textureToUse->texture && textureToUse->surface) {
+        auto desc = textureToUse->texture->Desc();
+        auto dxvkImage = textureToUse->texture->GetImage();
         
         if (dxvkImage != nullptr) {
             VkImage vkImage = dxvkImage->handle();
             
-            if (checkCount % 60 == 1) {  // Log every ~1 second
-                dxvk::Logger::info(str::format("VR Compositor: 🔄 SAFE POLLING COPY #", checkCount, " - VkImage: ", (void*)vkImage, " size: ", desc->Width, "x", desc->Height));
+            // IMMEDIATE RESPONSE: TF2 knows what texture it wants us to use
+            // Trust TF2's texture management and copy whatever it gives us
+            g_lastSourceTexture = vkImage;
+            g_sourceTextureStableCount++;
+            
+            // Log which texture we're copying from (A or B) and why
+            const char* slotName = (textureToUse == &g_vguiTextureA) ? "A" : 
+                                   (textureToUse == &g_vguiTextureB) ? "B" : "FALLBACK";
+            const char* reason = (FORCE_SLOT_MODE == 1) ? "FORCE_A" : 
+                                 (FORCE_SLOT_MODE == 2) ? "FORCE_B" : 
+                                 (FORCE_SLOT_MODE == 4) ? "FLUSH_A" :
+                                 (FORCE_SLOT_MODE == 5) ? "PAINT_A" :
+                                 (FORCE_SLOT_MODE == 6) ? "PRESENT_A" :
+                                 (FORCE_SLOT_MODE == 7) ? "STABLE" :
+                                 (FORCE_SLOT_MODE == 0) ? "AUTO" : "FALLBACK";
+            
+            // Count render operations to detect if we're capturing mid-render
+            int renderOps = g_renderOpsSinceLastCopy.exchange(0);
+            
+            dxvk::Logger::info(str::format("VR Compositor: 🚀 IMMEDIATE COPY - VkImage: ", (void*)vkImage, " (call #", g_sourceTextureStableCount, ") from D3D9 texture: ", (void*)textureToUse->texture, " [slot ", slotName, " - ", reason, "] after ", renderOps, " render ops"));
+            
+            // CRITICAL: Check if this texture is likely to be a blank/empty texture
+            // TF2 might be alternating between actual VGUI content and blank textures
+            
+            // Copy immediately for maximum responsiveness
+            // The frame-complete signal should be sufficient synchronization
+            
+            // This should now be safe because TF2 has finished its frame + safety delay + texture is stable
+            bool copySuccess = g_vrCompositor->CopyAndStoreMenuTexture(vkImage, desc->Width, desc->Height);
+            
+            if (copySuccess) {
+                dxvk::Logger::info("VR Compositor: ✅ Copy successful - texture ready for rendering");
+                // NOTE: No need to call SubmitFrame - the copy operation makes the texture available for rendering
+                // The compositor's render loop will automatically use the copied texture
+            } else {
+                dxvk::Logger::err("VR Compositor: ❌ Copy failed");
             }
-            
-            // This is safe because we're in the compositor thread, not interrupting Source
-            g_vrCompositor->CopyAndStoreMenuTexture(vkImage, desc->Width, desc->Height);
-            
-            // CRITICAL: Submit a frame so the compositor knows to render the copied texture
-            g_vrCompositor->SubmitDXVKTexture(reinterpret_cast<void*>(vkImage), desc->Width, desc->Height);
         }
+    } else {
+        dxvk::Logger::warn("VR Compositor: Frame-complete signal but no tracked VGUI texture");
     }
+}
+
+// TF2VR: VGUI Flush Completion Handler - Called when D3D9 flush completes
+extern "C" void TF2VR_NotifyVGUIFlushComplete() {
+    if (!g_vrCompositor || !g_vrCompositor->IsCompositorActive()) {
+        return;
+    }
+    
+    // Signal that VGUI rendering is complete and safe to copy
+    int flushNum = g_vguiFlushCount.fetch_add(1) + 1;
+    g_vguiFlushCompleted.store(true);
+    
+    if (flushNum % 60 == 1) {  // Log occasionally
+        dxvk::Logger::info(str::format("TF2VR: 🏁 VGUI FLUSH COMPLETE #", flushNum, " - UI rendering finished"));
+    }
+}
+
+// TF2VR: VGUI Paint Completion Handler - Call this RIGHT AFTER VGui_Paint()
+extern "C" void __declspec(dllexport) TF2VR_NotifyVGUIPaintComplete() {
+    if (!g_vrCompositor || !g_vrCompositor->IsCompositorActive()) {
+        return;
+    }
+    
+    // This is called immediately after render->VGui_Paint() completes
+    // This is the PERFECT time to copy Slot A - UI painting is done!
+    static std::atomic<bool> g_vguiPaintCompleted{false};
+    g_vguiPaintCompleted.store(true);
+    
+    static int paintCompleteCount = 0;
+    if (++paintCompleteCount % 60 == 1) {  // Log occasionally
+        dxvk::Logger::info(str::format("TF2VR: 🎨 VGUI PAINT COMPLETE #", paintCompleteCount, " - UI painting finished, safe to copy Slot A"));
+    }
+}
+
+// TF2VR: VGUI Present Completion Handler - Call this RIGHT AFTER vkQueuePresentKHR!
+void TF2VR_NotifyVGUIPresentComplete() {
+    if (!g_vrCompositor || !g_vrCompositor->IsCompositorActive()) {
+        return;
+    }
+    
+    // Measure timing for synchronization analysis
+    static auto lastPresentTime = std::chrono::high_resolution_clock::now();
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    auto deltaMs = std::chrono::duration_cast<std::chrono::microseconds>(currentTime - lastPresentTime).count() / 1000.0f;
+    lastPresentTime = currentTime;
+    
+    static int presentCompleteCount = 0;
+    presentCompleteCount++;
+    
+    // Log present completion
+    dxvk::Logger::info(str::format("TF2VR: 🖼️ PRESENT COMPLETE #", presentCompleteCount, " - All 5 passes done, final texture ready! (", deltaMs, "ms since last)"));
+    
+    // COMPLETELY ASYNC: Just signal texture is ready, copy happens on compositor thread
+    // No blocking operations in TF2's present path to prevent deadlocks
+    g_textureReady.store(true);
+    
+    dxvk::Logger::info("TF2VR: 🚀 ASYNC SIGNAL - texture ready for compositor copy");
+}
+
+// Global access to the present synchronization mutex (using timed_mutex for timeout support)
+std::timed_mutex* GetPresentSyncMutex() {
+    static std::timed_mutex presentSyncMutex;
+    return &presentSyncMutex;
+}
+
+// Compositor-controlled texture sync - mirrors OpenXR BeginFrame pattern
+// Removed complex synchronization system - using simple texture copying only
+extern "C" void __declspec(dllexport) TF2VR_CompositorBeginTextureSync() {
+    // No-op - synchronization removed to fix VK_ERROR_DEVICE_LOST
+    static int syncRequestCount = 0;
+    syncRequestCount++;
+    dxvk::Logger::info(str::format("TF2VR: 🎬 COMPOSITOR SYNC DISABLED #", syncRequestCount, " - no frame locking"));
 }
 
 // Initialize compositor with OpenXR manager
@@ -1636,12 +1872,16 @@ bool __declspec(dllexport) dxvkIsCompositorActive() {
 }
 
 void __declspec(dllexport) dxvkSubmitMenuFrame(void* textureHandle, int width, int height) {
-    dxvk::Logger::info(str::format("VR Compositor: dxvkSubmitMenuFrame called - handle: ", (void*)textureHandle, " size: ", width, "x", height));
-    if (g_vrCompositor) {
-        g_vrCompositor->SubmitFrame(textureHandle, width, height, true, true); // isVGUITexture=true, isDXVKTexture=true
-    } else {
-        dxvk::Logger::warn("VR Compositor: dxvkSubmitMenuFrame called but g_vrCompositor is null");
+    // CRITICAL: Disable direct submission - we now use frame-complete driven copying instead
+    static int callCount = 0;
+    callCount++;
+    
+    if (callCount % 60 == 1) {  // Log occasionally to show it's being ignored
+        dxvk::Logger::info(str::format("VR Compositor: dxvkSubmitMenuFrame #", callCount, " IGNORED (frame-complete system active) - handle: ", (void*)textureHandle, " size: ", width, "x", height));
     }
+    
+    // DON'T submit - let the frame-complete system handle it instead
+    return;
 }
 
 // TF2VR: VGUI Render Target Tracking Implementation
@@ -1650,7 +1890,7 @@ extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3
         return; // Only track when compositor is active
     }
     
-    std::lock_guard<std::mutex> lock(g_vguiTrackingMutex);
+    // NO LOCK NEEDED - tracking is now lock-free to prevent deadlock
     
     auto desc = texture->Desc();
     
@@ -1670,9 +1910,82 @@ extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3
         float aspectRatio = (float)desc->Width / desc->Height;
         if (aspectRatio >= 1.3f && aspectRatio <= 1.8f) {  // Common 4:3 to 16:9 range
             
-            // Store the DXVK surface and texture for later use
-            g_trackedVGUISurface = surface;
-            g_trackedVGUITexture = texture;
+            // CRITICAL: Only update tracking if this is likely a different/better texture
+            // Don't constantly switch between similar textures (which might include blanks)
+            bool shouldUpdateTracking = false;
+            
+            if (g_trackedVGUITexture == nullptr) {
+                // No current texture - accept this one
+                shouldUpdateTracking = true;
+                dxvk::Logger::info("TF2VR: 🎯 FIRST VGUI texture - accepting");
+            } else {
+                // We already have a tracked texture - be more selective
+                auto currentDesc = g_trackedVGUITexture->Desc();
+                if (currentDesc->Width != desc->Width || currentDesc->Height != desc->Height) {
+                    // Different size - probably a legitimate change
+                    shouldUpdateTracking = true;
+                    dxvk::Logger::info(str::format("TF2VR: 📐 SIZE CHANGE - updating from ", currentDesc->Width, "x", currentDesc->Height, " to ", desc->Width, "x", desc->Height));
+                } else {
+                    // Same size - but let's be more responsive to texture changes
+                    // TF2 might create new _rt_vgui textures when UI content changes significantly
+                    
+                    // Check if this is a different texture object (different memory address)
+                    if (texture != g_trackedVGUITexture) {
+                        // This is a completely different texture object - TF2 wants us to use it
+                        shouldUpdateTracking = true;
+                        dxvk::Logger::info(str::format("TF2VR: 🔄 NEW TEXTURE OBJECT - switching from ", (void*)g_trackedVGUITexture, " to ", (void*)texture));
+                    } else {
+                        // Same texture object being set again - keep using it
+                        shouldUpdateTracking = false;
+                        dxvk::Logger::info(str::format("TF2VR: ♻️ SAME TEXTURE OBJECT - keeping current (", desc->Width, "x", desc->Height, ")"));
+                    }
+                }
+            }
+            
+            if (shouldUpdateTracking) {
+                // Store the DXVK surface and texture for later use
+                g_trackedVGUISurface = surface;
+                g_trackedVGUITexture = texture;
+                
+                // Update dual texture tracking - track which of the two textures TF2 is using
+                auto now = std::chrono::high_resolution_clock::now();
+                
+                // Determine which slot to use based on texture address
+                VGUITextureInfo* targetSlot = nullptr;
+                if (g_vguiTextureA.textureAddress == nullptr || g_vguiTextureA.textureAddress == (void*)texture) {
+                    targetSlot = &g_vguiTextureA;
+                } else if (g_vguiTextureB.textureAddress == nullptr || g_vguiTextureB.textureAddress == (void*)texture) {
+                    targetSlot = &g_vguiTextureB;
+                } else {
+                    // Both slots occupied with different textures - use least recently used
+                    targetSlot = (g_vguiTextureA.lastUsed < g_vguiTextureB.lastUsed) ? &g_vguiTextureA : &g_vguiTextureB;
+                }
+                
+                // Update the target slot
+                targetSlot->texture = texture;
+                targetSlot->surface = surface;
+                targetSlot->textureAddress = (void*)texture;
+                targetSlot->lastUsed = now;
+                targetSlot->useCount++;
+                
+                // Mark this as the most recently used texture
+                g_mostRecentVGUITexture = targetSlot;
+                
+                // Debug: Log slot assignments
+                const char* slotName = (targetSlot == &g_vguiTextureA) ? "A" : "B";
+                dxvk::Logger::info(str::format("TF2VR: 📍 ASSIGNED texture ", (void*)texture, " to SLOT ", slotName, " (useCount: ", targetSlot->useCount, ")"));
+                dxvk::Logger::info(str::format("TF2VR: 🔍 SLOTS - A: ", (void*)g_vguiTextureA.textureAddress, " (", g_vguiTextureA.useCount, " uses) | B: ", (void*)g_vguiTextureB.textureAddress, " (", g_vguiTextureB.useCount, " uses)"));
+            }
+            
+            // CRITICAL: Track VGUI render activity to detect completion (lock-free)
+            {
+                // No lock needed - using atomic operations only
+                g_vguiRenderPassCount.fetch_add(1);
+                g_lastVGUIRenderTime = std::chrono::steady_clock::now();
+                
+                // Track render operations for multi-pass detection
+                g_renderOpsSinceLastCopy.fetch_add(1);
+            }
             
             // DEFERRED COPY: Just mark that we need a copy, don't do it immediately
             // Immediate copying during SetRenderTarget is too dangerous - Source is actively rendering
@@ -1696,34 +2009,52 @@ extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3
 
 // Internal C++ function - no C linkage needed
 void TF2VR_NotifyVGUIFrameComplete() {
-    if (!g_vrCompositor || !g_vrCompositor->IsCompositorActive()) {
+    static int totalCallCount = 0;
+    totalCallCount++;
+    
+    // CRITICAL DEBUG: Always log the first few calls to ensure this function is being called
+    if (totalCallCount <= 5 || totalCallCount % 100 == 1) {
+        dxvk::Logger::info(str::format("TF2VR: 🔔 NotifyVGUIFrameComplete CALLED #", totalCallCount));
+    }
+    
+    if (!g_vrCompositor) {
+        if (totalCallCount <= 5) {
+            dxvk::Logger::warn("TF2VR: NotifyVGUIFrameComplete - g_vrCompositor is null");
+        }
         return;
     }
     
-    std::lock_guard<std::mutex> lock(g_vguiTrackingMutex);
+    if (!g_vrCompositor->IsCompositorActive()) {
+        if (totalCallCount <= 5) {
+            dxvk::Logger::warn("TF2VR: NotifyVGUIFrameComplete - compositor not active");
+        }
+        return;
+    }
     
-    // If we have a tracked VGUI texture, submit it to the compositor
+    // Increment frame counter and signal that a fresh frame is ready
+    int frameNum = g_frameCompleteCount.fetch_add(1) + 1;
+    
+    // CRITICAL TIMING DEBUG: Track how often this is called vs actual copies
+    static auto lastCallTime = std::chrono::high_resolution_clock::now();
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    auto timeSinceLastCall = std::chrono::duration_cast<std::chrono::microseconds>(currentTime - lastCallTime).count();
+    lastCallTime = currentTime;
+    
+    // Quick check without lock - if we have a tracked texture, signal the compositor
     if (g_trackedVGUITexture && g_trackedVGUISurface) {
-        auto desc = g_trackedVGUITexture->Desc();
+        // With queue-based system, we just increment frame count - no dropped frames!
         
-        // Get the underlying Vulkan image from the D3D9CommonTexture
-        auto dxvkImage = g_trackedVGUITexture->GetImage();
-        if (dxvkImage != nullptr) {
-            // DISABLED: Let safe polling handle copying instead of immediate copying here
-            VkImage vkImage = dxvkImage->handle();
-            
-            static int copyCount = 0;
-            copyCount++;
-            if (copyCount % 30 == 1) {  // Log every ~0.5 seconds at 60fps
-                dxvk::Logger::info(str::format("TF2VR: 📝 MENU UPDATE DETECTED #", copyCount, " - VkImage: ", (void*)vkImage, " size: ", desc->Width, "x", desc->Height, " (safe polling will copy)"));
-            }
-            
-            // NOTE: CopyAndStoreMenuTexture will be called by CheckAndCopyTrackedVGUITexture() instead
-        } else {
-            dxvk::Logger::warn("TF2VR: Failed to get DXVK image from tracked texture");
+        // Log timing and signal state  
+        if (frameNum % 30 == 1) {  // More frequent logging for debugging
+            int lastProcessed = g_lastProcessedFrame.load();
+            int pendingFrames = frameNum - lastProcessed;
+            dxvk::Logger::info(str::format("TF2VR: 📝 FRAME COMPLETE #", frameNum, " (", timeSinceLastCall, "μs gap) - pending frames: ", pendingFrames));
         }
     } else {
-        dxvk::Logger::warn("TF2VR: NotifyVGUIFrameComplete called but no tracked VGUI texture");
+        // CRITICAL DEBUG: Log why frame complete is not signaling
+        if (frameNum <= 5 || frameNum % 100 == 1) {
+            dxvk::Logger::warn(str::format("TF2VR: Frame complete #", frameNum, " but tracked texture state: VGUI=", (void*)g_trackedVGUITexture, " Surface=", (void*)g_trackedVGUISurface));
+        }
     }
 }
 

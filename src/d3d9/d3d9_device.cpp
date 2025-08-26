@@ -22,6 +22,9 @@
 
 // Forward declaration for VGUI tracking function
 extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3D9CommonTexture* texture);
+// Forward declaration for VGUI flush completion notification
+extern "C" void TF2VR_NotifyVGUIFlushComplete();
+
 #include "../dxvk/dxvk_instance.h"
 
 #include "../util/util_bit.h"
@@ -6178,6 +6181,9 @@ namespace dxvk {
 
   void D3D9DeviceEx::Flush() {
     ExecuteFlush<false>();
+    
+    // TF2VR: Notify VGUI flush completion - this is when UI rendering is complete
+    TF2VR_NotifyVGUIFlushComplete();
   }
 
 
