@@ -282,6 +282,9 @@ void VRCompositor::SetSourceEngineState(SourceEngineState state) {
     
     m_currentState = state;
     
+    // Initialize synchronization - TF2 should wait for VR frame completion
+    m_tf2CanRenderFrame = false;
+    
     // Activate compositor during loading and menu states
     bool shouldActivate = (state == SOURCE_STATE_MENU || state == SOURCE_STATE_LOADING);
     
@@ -1641,6 +1644,26 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
+    // AFTER xrEndFrame: Handle TF2 frame completion if ready
+    if (m_tf2FrameReady.load()) {
+        Logger::info("VRCompositor: 🖼️ VR frame complete - copying TF2 texture and unblocking");
+        
+        // Copy the texture from TF2
+        extern void CheckAndCopyTrackedVGUITexture();
+        ::CheckAndCopyTrackedVGUITexture();
+        
+        // Clear the frame ready flag
+        m_tf2FrameReady = false;
+        
+        // UNBLOCK TF2: VR frame is complete, TF2 can continue
+        {
+            std::lock_guard<std::mutex> lock(m_tf2FrameSignalMutex);
+            m_tf2CanRenderFrame = true;
+            Logger::info("VRCompositor: 🔓 UNBLOCKING TF2 - VR frame complete, TF2 can render next frame");
+        }
+        m_tf2FrameCondition.notify_all();
+    }
+    
     Logger::info("VRCompositor: ✅ Frame rendered successfully");
     return true;
 }
@@ -2387,6 +2410,17 @@ void VRCompositor::UpdateDescriptorSetWithTexture(VkImageView textureView) {
     vkUpdateDescriptorSets(m_compositorDevice, 1, &descriptorWrite, 0, nullptr);
     
     Logger::info("VRCompositor: ✅ Descriptor set updated with new texture");
+}
+
+void VRCompositor::NotifyTF2FrameComplete() {
+    // This is called when TF2 finishes a frame and is blocked in PostPresentCallback
+    // Our job is to copy the texture during our VR frame and unblock after xrEndFrame
+    
+    Logger::info("VRCompositor: 📥 TF2 frame complete notification - will copy during VR frame");
+    
+    // Signal that we have a fresh TF2 frame ready for copying
+    // The actual copy and unblock will happen in RunIndependentFrame after xrEndFrame
+    m_tf2FrameReady = true;
 }
 
 } // namespace dxvk

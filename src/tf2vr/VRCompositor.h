@@ -4,6 +4,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <chrono>
 
@@ -176,6 +177,13 @@ public:
     
     // SAFE TEXTURE COPYING - Public method for external calls
     bool CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int height);
+    
+    // TF2 FRAME SYNCHRONIZATION - Block TF2 at frame end for texture copy
+    std::mutex m_tf2FrameSignalMutex;
+    std::condition_variable m_tf2FrameCondition;
+    std::atomic<bool> m_tf2CanRenderFrame{false};
+    std::atomic<bool> m_tf2FrameReady{false};
+    void NotifyTF2FrameComplete();
 
 private:
     // Vulkan resource management
