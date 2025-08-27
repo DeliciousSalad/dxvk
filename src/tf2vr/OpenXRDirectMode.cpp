@@ -29,6 +29,9 @@ using namespace dxvk;
 
 extern VkSubmitThreadCallback *g_pVkSubmitThreadCallback;
 
+// Forward declaration for TF2VR VGUI functions
+extern "C" void TF2VR_NotifyVGUIPresentComplete();
+
 #define BUTTON_DEADZONE  0.05f;
 
 // Ensure correct swapchain image type
@@ -462,7 +465,6 @@ void OpenXRDirectMode::PrePresentCallBack()
 	if (IsVRCompositorActive()) {
 		// TEXTURE COPY NOTIFICATION: Right before DXVK present - perfect timing!
 		// This mirrors the main rendering setup timing
-		extern void TF2VR_NotifyVGUIPresentComplete();
 		TF2VR_NotifyVGUIPresentComplete();
 		
 		Logger::info("OpenXRDirectMode: 📸 TEXTURE COPY - Right before DXVK present (perfect timing)");
@@ -491,7 +493,6 @@ void OpenXRDirectMode::PostPresentCallback()
 	// Don't interfere with compositor's frame management
 	extern bool IsVRCompositorActive();
 	extern void TF2VR_NotifyVGUIFrameComplete();
-	extern void TF2VR_NotifyVGUIPresentComplete();  // New present-complete hook
 	extern std::timed_mutex* GetPresentSyncMutex();  // Forward declaration
 	if (IsVRCompositorActive()) {
 		// Notify that a VGUI frame may have been completed
@@ -1652,8 +1653,8 @@ void CheckAndCopyTrackedVGUITexture() {
     // Use the most recently tracked texture (simple approach)
     VGUITextureInfo* textureToUse = g_mostRecentVGUITexture;
     
-    // SIMPLE MODE: Use Slot A which has the complete UI after present
-    static const int FORCE_SLOT_MODE = 6; // Present triggered mode (simple and working)
+    // DYNAMIC MODE: Use Slot B during loading, Slot A otherwise  
+    static const int FORCE_SLOT_MODE = 9; // NEW: Simple state-based slot selection
     
     if (FORCE_SLOT_MODE == 1 && g_vguiTextureA.texture != nullptr) {
         // Force use Slot A only
@@ -1661,6 +1662,72 @@ void CheckAndCopyTrackedVGUITexture() {
     } else if (FORCE_SLOT_MODE == 2 && g_vguiTextureB.texture != nullptr) {
         // Force use Slot B only
         textureToUse = &g_vguiTextureB;
+    } else if (FORCE_SLOT_MODE == 8) {
+        // SMART MODE: Detect loading state and choose appropriate slot
+        // During loading: use Slot B (has loading screen content)
+        // During menu/game: use Slot A (has complete UI)
+        
+        // Simple heuristic: Use Slot B if it's been updated more recently than Slot A
+        // During loading, Slot B gets the loading screen content while Slot A stays stale
+        // During normal UI, Slot A gets updated with complete UI
+        
+        auto now = std::chrono::high_resolution_clock::now();
+        
+        // Calculate how recently each slot was used
+        auto slotAAge = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_vguiTextureA.lastUsed).count();
+        auto slotBAge = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_vguiTextureB.lastUsed).count();
+        
+        // If Slot B is much more recent than Slot A, we're probably loading
+        bool probablyLoading = (g_vguiTextureB.texture != nullptr) && 
+                              (g_vguiTextureA.texture != nullptr) &&
+                              (slotBAge < slotAAge - 100); // Slot B updated more than 100ms more recently
+        
+        if (probablyLoading) {
+            textureToUse = &g_vguiTextureB;  // Loading screen is on Slot B
+            static int logCount = 0;
+            if (++logCount % 120 == 1) {
+                dxvk::Logger::info(str::format("TF2VR: 🔄 SMART MODE - Using Slot B (loading, B age: ", slotBAge, "ms, A age: ", slotAAge, "ms)"));
+            }
+        } else if (g_vguiTextureA.texture != nullptr) {
+            textureToUse = &g_vguiTextureA;  // Complete UI is on Slot A
+            static int logCount = 0;
+            if (++logCount % 120 == 1) {
+                dxvk::Logger::info(str::format("TF2VR: 🔄 SMART MODE - Using Slot A (menu/game, A age: ", slotAAge, "ms, B age: ", slotBAge, "ms)"));
+            }
+        } else if (g_vguiTextureB.texture != nullptr) {
+            textureToUse = &g_vguiTextureB;  // Fallback to Slot B
+        }
+    } else if (FORCE_SLOT_MODE == 9) {
+        // REALTIME MODE: Check loading state directly without relying on delayed state updates
+        // Use the same logic as DetermineSourceState() but execute it here in real-time
+        
+        // Get the stored state first (might be delayed)
+        SourceEngineState storedState = g_vrCompositor ? g_vrCompositor->GetCurrentState() : SOURCE_STATE_GAMEPLAY;
+        
+        // Also check loading directly (same as what the client checks)
+        // Note: We can't call engine functions from DXVK, but we can use texture usage patterns
+        // If Slot B is more active than Slot A, we're probably loading
+        auto now = std::chrono::high_resolution_clock::now();
+        auto slotAAge = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_vguiTextureA.lastUsed).count();
+        auto slotBAge = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_vguiTextureB.lastUsed).count();
+        
+        // Prefer stored state if available, fall back to heuristic
+        bool probablyLoading = (storedState == SOURCE_STATE_LOADING) || 
+                              (storedState == SOURCE_STATE_GAMEPLAY && slotBAge < slotAAge - 50);
+        
+        // Minimal logging for state decisions
+        static int debugCount = 0;
+        if (++debugCount % 300 == 1) {  // Much less frequent logging
+            dxvk::Logger::info(str::format("TF2VR: State=", storedState, " Loading=", probablyLoading ? "YES" : "NO"));
+        }
+        
+        if (probablyLoading && g_vguiTextureB.texture != nullptr) {
+            textureToUse = &g_vguiTextureB;  // Loading screen is on Slot B
+        } else if (g_vguiTextureA.texture != nullptr) {
+            textureToUse = &g_vguiTextureA;  // Complete UI is on Slot A
+        } else if (g_vguiTextureB.texture != nullptr) {
+            textureToUse = &g_vguiTextureB;  // Fallback to Slot B
+        }
     } else if (FORCE_SLOT_MODE == 4 && g_vguiTextureA.texture != nullptr) {
         // Slot A on flush only - use the existing flush hook without additional timing
         // This relies on D3D9 Flush() being called when UI rendering is complete
@@ -1798,7 +1865,20 @@ extern "C" void TF2VR_NotifyVGUIFlushComplete() {
 
 // TF2VR: VGUI Paint Completion Handler - Call this RIGHT AFTER VGui_Paint()
 extern "C" void __declspec(dllexport) TF2VR_NotifyVGUIPaintComplete() {
-    if (!g_vrCompositor || !g_vrCompositor->IsCompositorActive()) {
+    static int callCount = 0;
+    callCount++;
+    
+    if (!g_vrCompositor) {
+        if (callCount % 60 == 1) {
+            dxvk::Logger::warn("TF2VR: 🚫 PAINT COMPLETE REJECTED - g_vrCompositor is null");
+        }
+        return;
+    }
+    
+    if (!g_vrCompositor->IsCompositorActive()) {
+        if (callCount % 60 == 1) {
+            dxvk::Logger::warn("TF2VR: 🚫 PAINT COMPLETE REJECTED - compositor not active");
+        }
         return;
     }
     
@@ -1811,10 +1891,14 @@ extern "C" void __declspec(dllexport) TF2VR_NotifyVGUIPaintComplete() {
     if (++paintCompleteCount % 60 == 1) {  // Log occasionally
         dxvk::Logger::info(str::format("TF2VR: 🎨 VGUI PAINT COMPLETE #", paintCompleteCount, " - UI painting finished, safe to copy Slot A"));
     }
+    
+    // TF2VR: Also signal that texture is ready for copy (same as TF2VR_NotifyVGUIPresentComplete)
+    g_textureReady.store(true);
+    dxvk::Logger::info("TF2VR: 🚀 TEXTURE READY - VGUI paint complete, signaling for copy");
 }
 
 // TF2VR: VGUI Present Completion Handler - Call this RIGHT AFTER vkQueuePresentKHR!
-void TF2VR_NotifyVGUIPresentComplete() {
+extern "C" void TF2VR_NotifyVGUIPresentComplete() {
     if (!g_vrCompositor || !g_vrCompositor->IsCompositorActive()) {
         return;
     }
@@ -1879,11 +1963,8 @@ bool IsVRCompositorActive() {
 extern "C" {
 
 void __declspec(dllexport) dxvkSetSourceState(int state) {
-    dxvk::Logger::info(str::format("dxvkSetSourceState called with state: ", state, " g_vrCompositor: ", (void*)g_vrCompositor));
     if (g_vrCompositor) {
         g_vrCompositor->SetSourceState(static_cast<SourceEngineState>(state));
-    } else {
-        dxvk::Logger::warn("dxvkSetSourceState: g_vrCompositor is null!");
     }
 }
 

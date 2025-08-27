@@ -170,6 +170,7 @@ public:
     
     // State management
     void SetSourceEngineState(SourceEngineState state);
+    SourceEngineState GetCurrentState() const { return m_currentState.load(); }
     bool IsActive() const { return m_compositorActive.load(); }
     bool IsCompositorActive() const;
     void SetSourceState(SourceEngineState state);

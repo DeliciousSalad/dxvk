@@ -1640,6 +1640,15 @@ namespace dxvk {
       // 5. Track only when VR compositor is active (to avoid tracking unnecessary textures)
       
       auto desc = texInfo->Desc();
+      
+      // DEBUG: Log all render target changes during loading for diagnostics
+      static int s_rtCallCount = 0;
+      s_rtCallCount++;
+      if (s_rtCallCount % 100 == 1) {  // Every 100 calls to avoid spam
+        bool isVRActive = IsVRCompositorActive();
+        dxvk::Logger::info(str::format("TF2VR: 🔍 SetRenderTarget #", s_rtCallCount, " - ", desc->Width, "x", desc->Height, " VRActive:", isVRActive ? "YES" : "NO", " Index:", RenderTargetIndex));
+      }
+      
       if ((desc->Usage & D3DUSAGE_RENDERTARGET) && 
           RenderTargetIndex == 0 &&
           IsVRCompositorActive() &&
@@ -1650,6 +1659,7 @@ namespace dxvk {
         // Additional heuristic: check if this looks like a screen-sized UI texture
         float aspectRatio = (float)desc->Width / desc->Height;
         if (aspectRatio >= 1.0f && aspectRatio <= 2.5f) {  // Reasonable aspect ratios for UI
+          dxvk::Logger::info(str::format("TF2VR: 🎯 VGUI SetRenderTarget detected - ", desc->Width, "x", desc->Height, " format:", (int)desc->Format));
           TF2VR_TrackVGUIRenderTarget(rt, texInfo);
         }
       }

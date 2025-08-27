@@ -277,9 +277,6 @@ void VRCompositor::SubmitFrame(void* textureHandle, int width, int height, bool 
 }
 
 void VRCompositor::SetSourceEngineState(SourceEngineState state) {
-    const char* stateNames[] = {"GAMEPLAY", "MENU", "LOADING", "TRANSITION"};
-    Logger::info(str::format("VRCompositor: 🎮 State change: ", stateNames[state], " (", static_cast<int>(state), ")"));
-    
     m_currentState = state;
     
     // Initialize synchronization - TF2 should wait for VR frame completion
