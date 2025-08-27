@@ -1616,6 +1616,8 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
+    // No blocking here - TF2 should already be blocked from previous frame
+    
     // Begin the frame
     XrFrameBeginInfo frameBeginInfo = { XR_TYPE_FRAME_BEGIN_INFO };
     result = xrBeginFrame(m_cachedSession, &frameBeginInfo);
@@ -1644,25 +1646,20 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
-    // AFTER xrEndFrame: Handle TF2 frame completion if ready
-    if (m_tf2FrameReady.load()) {
-        Logger::info("VRCompositor: 🖼️ VR frame complete - copying TF2 texture and unblocking");
-        
-        // Copy the texture from TF2
-        extern void CheckAndCopyTrackedVGUITexture();
-        ::CheckAndCopyTrackedVGUITexture();
-        
-        // Clear the frame ready flag
-        m_tf2FrameReady = false;
-        
-        // UNBLOCK TF2: VR frame is complete, TF2 can continue
-        {
-            std::lock_guard<std::mutex> lock(m_tf2FrameSignalMutex);
-            m_tf2CanRenderFrame = true;
-            Logger::info("VRCompositor: 🔓 UNBLOCKING TF2 - VR frame complete, TF2 can render next frame");
-        }
-        m_tf2FrameCondition.notify_all();
+    // AFTER xrEndFrame: Always copy texture and unblock exactly one TF2 frame
+    Logger::info("VRCompositor: 🖼️ VR frame complete - copying TF2 texture and unblocking");
+    
+    // Copy the texture from TF2 if available
+    extern void CheckAndCopyTrackedVGUITexture();
+    ::CheckAndCopyTrackedVGUITexture();
+    
+    // UNBLOCK TF2: VR frame is complete, allow exactly one TF2 frame
+    {
+        std::lock_guard<std::mutex> lock(m_tf2FrameSignalMutex);
+        m_tf2CanRenderFrame = true;
+        Logger::info("VRCompositor: 🔓 UNBLOCKING TF2 - VR frame complete, TF2 can render next frame");
     }
+    m_tf2FrameCondition.notify_all();
     
     Logger::info("VRCompositor: ✅ Frame rendered successfully");
     return true;
@@ -2414,13 +2411,11 @@ void VRCompositor::UpdateDescriptorSetWithTexture(VkImageView textureView) {
 
 void VRCompositor::NotifyTF2FrameComplete() {
     // This is called when TF2 finishes a frame and is blocked in PostPresentCallback
-    // Our job is to copy the texture during our VR frame and unblock after xrEndFrame
+    // The VR compositor will unblock TF2 after completing its next frame
     
-    Logger::info("VRCompositor: 📥 TF2 frame complete notification - will copy during VR frame");
+    Logger::info("VRCompositor: 📥 TF2 frame complete notification - will be unblocked after next VR frame");
     
-    // Signal that we have a fresh TF2 frame ready for copying
-    // The actual copy and unblock will happen in RunIndependentFrame after xrEndFrame
-    m_tf2FrameReady = true;
+    // No action needed here - TF2 will be unblocked after the next VR frame completes
 }
 
 } // namespace dxvk

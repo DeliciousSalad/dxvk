@@ -401,10 +401,25 @@ void OpenXRDirectMode::PrePresent(dxvk::D3D9DeviceEx *device)
 		return;
 	}
 
-	// Don't interfere with compositor's frame management
+	// COMPOSITOR FRAME CONTROL: Block TF2 at frame START if compositor is active
 	extern bool IsVRCompositorActive();
 	if (IsVRCompositorActive()) {
-		Logger::info("OpenXRDirectMode: PrePresent skipped - compositor is active");
+		if (g_vrCompositor) {
+			Logger::info("OpenXRDirectMode: 🚫 PrePresent BLOCKING TF2 - waiting for VR frame permission");
+			
+			// BLOCK HERE: Wait for compositor to allow this frame to proceed
+			std::unique_lock<std::mutex> lock(g_vrCompositor->m_tf2FrameSignalMutex);
+			g_vrCompositor->m_tf2FrameCondition.wait(lock, [&] {
+				return g_vrCompositor->m_tf2CanRenderFrame.load();
+			});
+			
+			// CONSUME PERMISSION: Set to false so only this frame can proceed
+			g_vrCompositor->m_tf2CanRenderFrame = false;
+			
+			Logger::info("OpenXRDirectMode: ✅ PrePresent UNBLOCKED - TF2 frame allowed to proceed");
+		} else {
+			Logger::info("OpenXRDirectMode: PrePresent skipped - compositor is active");
+		}
 		return;
 	}
 
@@ -482,20 +497,10 @@ void OpenXRDirectMode::PostPresentCallback()
 		// Notify that a VGUI frame may have been completed
 		TF2VR_NotifyVGUIFrameComplete();
 		
-		// CRITICAL SYNCHRONIZATION: Block TF2 at frame end and wait for compositor to copy texture
+		// NOTIFY COMPLETION: Signal compositor that frame is ready for copy
 		if (g_vrCompositor) {
-			Logger::info("OpenXRDirectMode: 🚫 PostPresent BLOCKING TF2 - frame complete, waiting for compositor copy");
-			
-			// Signal compositor that frame is ready for copy
+			Logger::info("OpenXRDirectMode: 📝 PostPresent - notifying compositor of frame completion");
 			g_vrCompositor->NotifyTF2FrameComplete();
-			
-			// BLOCK HERE: Wait for compositor to finish copying and signal us to continue
-			std::unique_lock<std::mutex> lock(g_vrCompositor->m_tf2FrameSignalMutex);
-			g_vrCompositor->m_tf2FrameCondition.wait(lock, [&] {
-				return g_vrCompositor->m_tf2CanRenderFrame.load();
-			});
-			
-			Logger::info("OpenXRDirectMode: ✅ PostPresent UNBLOCKED - compositor copy complete, TF2 can continue");
 		}
 		
 		return;
@@ -1411,8 +1416,7 @@ void OpenXRDirectMode::SetRenderTextureSize(uint32_t width, uint32_t height, int
 {
 	m_nRenderWidth = width;
 	m_nRenderHeight = height;
-	int clampedMSAA = (msaa < 1) ? 1 : ((msaa > 16) ? 16 : msaa);
-	m_nMSAA = clampedMSAA;
+	m_nMSAA = std::max(1, std::min(16, msaa));
 
   	if (m_nMSAA == 1)
     	m_nMSAA = 0;
