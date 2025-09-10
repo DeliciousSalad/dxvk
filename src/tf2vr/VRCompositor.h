@@ -240,6 +240,10 @@ private:
     // Texture management
     void UpdateDescriptorSetWithTexture(VkImageView textureView);
     
+    // HUD Position Management
+    bool UpdateQuadFromGameHUD();
+    bool UpdateVertexBuffer();  // Update GPU vertex buffer with current m_quadVertices
+    
     // Compositor thread management
     void StartCompositor();
     void StopCompositor();

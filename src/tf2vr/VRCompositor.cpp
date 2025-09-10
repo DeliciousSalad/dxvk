@@ -1,5 +1,6 @@
 #include "VRCompositor.h"
 #include "hmdWrapper.h"
+#include "hud_position_shared.h"
 #include "../util/util_string.h"
 #include "../util/log/log.h"
 
@@ -377,9 +378,7 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
     
     static int copyCallCount = 0;
     copyCallCount++;
-    
-    Logger::info(str::format("VRCompositor: 🎯 FRAME-COMPLETE COPY #", copyCallCount, " - VkImage: ", (void*)sourceTexture, " size: ", width, "x", height));
-    
+
     // Check if we need to recreate the copied texture with new dimensions
     if (m_copiedTextureWidth != width || m_copiedTextureHeight != height || m_copiedMenuTexture == VK_NULL_HANDLE) {
         
@@ -904,7 +903,7 @@ bool VRCompositor::CreateVulkanPipeline() {
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;  // Disable backface culling for debugging
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
     
@@ -1475,6 +1474,14 @@ void VRCompositor::StartCompositor() {
     
     Logger::info("VRCompositor: 🚀 Starting compositor thread");
     
+    // CAPTURE HUD POSITION: Update quad position from last known gameplay HUD location
+    // This ensures seamless transition from gameplay to compositor
+    if (UpdateQuadFromGameHUD()) {
+        Logger::info("VRCompositor: ✅ Positioned compositor HUD at last known gameplay location");
+    } else {
+        Logger::info("VRCompositor: ⚠️ No valid gameplay HUD position found, using default positioning");
+    }
+    
     m_shouldStop = false;
     m_compositorActive = true;
     
@@ -1512,7 +1519,167 @@ void VRCompositor::CompositorThreadFunc() {
     Logger::info("VRCompositor: 🧵 Compositor thread ending");
 }
 
+bool VRCompositor::UpdateQuadFromGameHUD() {
+    // Get the current HUD position from the shared data
+    SharedHUDPositionData hudPos = GetCurrentHUDPosition();
+    
+    // DEBUG: Add more detailed logging to understand what's happening
+    static int debugCallCount = 0;
+    debugCallCount++;
+    
+    // Check if the data is valid and not too old (within last 2 seconds)
+    auto currentTime = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    
+    if (!hudPos.is_valid || (currentTime - hudPos.last_update_time) > 30.0) 
+    {  
+        return false;
+    }
+    
+    // Convert Source engine coordinates to OpenXR coordinates
+    // Note: You may need to apply coordinate system transformations here
+    // depending on how your OpenXR coordinate system relates to Source's
+    
+    // Set quad vertices based on the HUD bounds from the game
+    // We'll create a simple quad using the corners provided by the game
+    
+    // Calculate the center and size from the corners
+    float centerX = (hudPos.upper_left[0] + hudPos.upper_right[0] + hudPos.lower_left[0] + hudPos.lower_right[0]) / 4.0f;
+    float centerY = (hudPos.upper_left[1] + hudPos.upper_right[1] + hudPos.lower_left[1] + hudPos.lower_right[1]) / 4.0f;
+    float centerZ = (hudPos.upper_left[2] + hudPos.upper_right[2] + hudPos.lower_left[2] + hudPos.lower_right[2]) / 4.0f;
+    
+    // Calculate width and height vectors
+    float width = sqrt(pow(hudPos.upper_right[0] - hudPos.upper_left[0], 2) + 
+                      pow(hudPos.upper_right[1] - hudPos.upper_left[1], 2) + 
+                      pow(hudPos.upper_right[2] - hudPos.upper_left[2], 2));
+    float height = sqrt(pow(hudPos.lower_left[0] - hudPos.upper_left[0], 2) + 
+                       pow(hudPos.lower_left[1] - hudPos.upper_left[1], 2) + 
+                       pow(hudPos.lower_left[2] - hudPos.upper_left[2], 2));
+    
+    // Use the actual corner positions (already converted to meters and VR coordinate system by game client)
+    // NO additional scaling needed - coordinates are already in meters
+    float ul_x = hudPos.upper_left[0];
+    float ul_y = hudPos.upper_left[1];
+    float ul_z = hudPos.upper_left[2];
+    
+    float ur_x = hudPos.upper_right[0];
+    float ur_y = hudPos.upper_right[1];
+    float ur_z = hudPos.upper_right[2];
+    
+    float ll_x = hudPos.lower_left[0];
+    float ll_y = hudPos.lower_left[1];
+    float ll_z = hudPos.lower_left[2];
+    
+    float lr_x = hudPos.lower_right[0];
+    float lr_y = hudPos.lower_right[1];
+    float lr_z = hudPos.lower_right[2];
+    
+    // Set vertices using the actual corner positions (preserves rotation and orientation)
+    // Bottom-left (corresponds to lower-left)
+    m_quadVertices[0].position[0] = ll_x;
+    m_quadVertices[0].position[1] = ll_y;
+    m_quadVertices[0].position[2] = ll_z;
+    m_quadVertices[0].texCoord[0] = 0.0f;
+    m_quadVertices[0].texCoord[1] = 0.0f;
+    m_quadVertices[0].color[0] = 1.0f;
+    m_quadVertices[0].color[1] = 1.0f;
+    m_quadVertices[0].color[2] = 1.0f;
+    
+    // Bottom-right (corresponds to lower-right)
+    m_quadVertices[1].position[0] = lr_x;
+    m_quadVertices[1].position[1] = lr_y;
+    m_quadVertices[1].position[2] = lr_z;
+    m_quadVertices[1].texCoord[0] = 1.0f;
+    m_quadVertices[1].texCoord[1] = 0.0f;
+    m_quadVertices[1].color[0] = 1.0f;
+    m_quadVertices[1].color[1] = 1.0f;
+    m_quadVertices[1].color[2] = 1.0f;
+    
+    // Top-right (corresponds to upper-right)
+    m_quadVertices[2].position[0] = ur_x;
+    m_quadVertices[2].position[1] = ur_y;
+    m_quadVertices[2].position[2] = ur_z;
+    m_quadVertices[2].texCoord[0] = 1.0f;
+    m_quadVertices[2].texCoord[1] = 1.0f;
+    m_quadVertices[2].color[0] = 1.0f;
+    m_quadVertices[2].color[1] = 1.0f;
+    m_quadVertices[2].color[2] = 1.0f;
+    
+    // Top-left (corresponds to upper-left)
+    m_quadVertices[3].position[0] = ul_x;
+    m_quadVertices[3].position[1] = ul_y;
+    m_quadVertices[3].position[2] = ul_z;
+    m_quadVertices[3].texCoord[0] = 0.0f;
+    m_quadVertices[3].texCoord[1] = 1.0f;
+    m_quadVertices[3].color[0] = 1.0f;
+    m_quadVertices[3].color[1] = 1.0f;
+    m_quadVertices[3].color[2] = 1.0f;
+    
+    // Update the GPU vertex buffer with the new positions
+    if (!UpdateVertexBuffer()) {
+        Logger::warn("VRCompositor: Failed to update vertex buffer after setting new quad position");
+        return false;
+    }
+    
+    // Log the successful update
+    static int updateCount = 0;
+    updateCount++;
+    // Log first few updates for verification
+    if (updateCount <= 2) {
+        Logger::info(str::format("VRCompositor: Updated quad from game HUD #", updateCount,
+            " - Custom bounds: ", hudPos.is_custom_bounds ? "true" : "false"));
+    }
+    
+    return true;
+}
+
+bool VRCompositor::UpdateVertexBuffer() {
+    if (m_vertexBuffer == VK_NULL_HANDLE || m_vertexBufferMemory == VK_NULL_HANDLE) {
+        Logger::warn("VRCompositor: Cannot update vertex buffer - not initialized");
+        return false;
+    }
+    
+    // Convert m_quadVertices (4 vertices) to triangle list (6 vertices) for GPU
+    QuadVertex triangleVertices[6] = {
+        // Triangle 1 (counter-clockwise)
+        m_quadVertices[0],  // Bottom-left
+        m_quadVertices[2],  // Top-right  
+        m_quadVertices[1],  // Bottom-right
+        
+        // Triangle 2 (counter-clockwise)
+        m_quadVertices[0],  // Bottom-left
+        m_quadVertices[3],  // Top-left
+        m_quadVertices[2]   // Top-right
+    };
+    
+    VkDeviceSize bufferSize = sizeof(triangleVertices);
+    
+    // Map memory and update vertex buffer
+    void* data;
+    VkResult result = vkMapMemory(m_compositorDevice, m_vertexBufferMemory, 0, bufferSize, 0, &data);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to map vertex buffer memory - error: ", static_cast<int>(result)));
+        return false;
+    }
+    
+    memcpy(data, triangleVertices, (size_t)bufferSize);
+    vkUnmapMemory(m_compositorDevice, m_vertexBufferMemory);
+    
+    Logger::info("VRCompositor: ✅ Vertex buffer updated with new quad position");
+    return true;
+}
+
 void VRCompositor::SetupQuadVertices() {
+    // Try to get position from game first
+    Logger::info("VRCompositor: SetupQuadVertices - attempting to get game HUD data...");
+    if (UpdateQuadFromGameHUD()) {
+        // Successfully updated from game data, we're done
+        Logger::info("VRCompositor: ✅ Using game HUD position data");
+        return;
+    }
+    
+    // Fallback to default positioning if no game data available
+    Logger::warn("VRCompositor: ⚠️ No valid game HUD data, using fallback position");
     // Create a quad positioned 2.5 meters in front of the user
     // Size: 2m wide x 1.125m tall (16:9 aspect ratio)
     float halfWidth = 1.0f;   // 2m wide (16 units)
@@ -1528,11 +1695,6 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[0].color[0] = 1.0f; // White for proper texture rendering
     m_quadVertices[0].color[1] = 1.0f;
     m_quadVertices[0].color[2] = 1.0f;
-    
-    // Bottom-right
-    m_quadVertices[1].position[0] = halfWidth;
-    m_quadVertices[1].position[1] = -halfHeight;
-    m_quadVertices[1].position[2] = distance;
     m_quadVertices[1].texCoord[0] = 1.0f;
     m_quadVertices[1].texCoord[1] = 0.0f; // Fixed: Bottom should be 0.0f, not 1.0f
     m_quadVertices[1].color[0] = 1.0f;
@@ -1558,6 +1720,9 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[3].color[0] = 1.0f;
     m_quadVertices[3].color[1] = 1.0f;
     m_quadVertices[3].color[2] = 1.0f;
+    
+    // Update the GPU vertex buffer with the default positions
+    UpdateVertexBuffer();
     
     Logger::info("VRCompositor: ✅ Quad vertices set up - white 2x1.125m quad (16:9) at 2.5m distance");
 }
@@ -2025,7 +2190,7 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;  // Re-enable backface culling
+    rasterizer.cullMode = VK_CULL_MODE_NONE;  // Disable backface culling for debugging
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
     

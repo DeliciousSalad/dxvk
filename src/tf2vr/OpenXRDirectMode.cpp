@@ -1,5 +1,6 @@
 #include "OpenXRDirectMode.h"
 #include "HMDInterface.h"
+#include "hud_position_shared.h"
 #include <cstring>
 #include <unordered_set>
 #include <mutex>
@@ -1628,6 +1629,34 @@ static VkImage g_lastSourceTexture = VK_NULL_HANDLE;
 static int g_sourceTextureStableCount = 0;
 
 // Track texture usage frequency to prefer final outputs over intermediates
+
+// ============================================================================
+// HUD Position Sharing System
+// ============================================================================
+
+
+// Global shared HUD position data - accessible from both game and compositor
+static SharedHUDPositionData g_sharedHUDPosition = {
+    {0.0f, 0.0f, 0.0f},      // viewer_pos
+    {0.0f, 0.0f, 0.0f},      // upper_left
+    {0.0f, 0.0f, 0.0f},      // upper_right
+    {0.0f, 0.0f, 0.0f},      // lower_left
+    {0.0f, 0.0f, 0.0f},      // lower_right
+    0.0,                     // last_update_time
+    false,                   // is_valid
+    false,                   // is_custom_bounds
+    0,                       // frame_number
+    1.0f                     // world_scale
+};
+
+// Mutex to protect shared HUD position data
+static std::mutex g_hudPositionMutex;
+
+// Function for VRCompositor to access current HUD position data
+SharedHUDPositionData GetCurrentHUDPosition() {
+    std::lock_guard<std::mutex> lock(g_hudPositionMutex);
+    return g_sharedHUDPosition;  // Return a copy to avoid race conditions
+}
 struct TextureUsageInfo {
     VkImage textureHandle;
     int usageCount;
@@ -2118,6 +2147,57 @@ extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3
     } else {
         dxvk::Logger::info(str::format("TF2VR: Rejected (size outside 800x600 to 2560x1440 range)"));
     }
+}
+
+// TF2VR: HUD Position Communication - Update HUD quad position from game
+extern "C" void __declspec(dllexport) TF2VR_UpdateHUDPosition(
+    float viewer_x, float viewer_y, float viewer_z,
+    float ul_x, float ul_y, float ul_z,
+    float ur_x, float ur_y, float ur_z,
+    float ll_x, float ll_y, float ll_z,
+    float lr_x, float lr_y, float lr_z,
+    bool is_custom_bounds, int frame_number, float world_scale) {
+    
+    std::lock_guard<std::mutex> lock(g_hudPositionMutex);
+    
+    // Update the shared HUD position data
+    g_sharedHUDPosition.viewer_pos[0] = viewer_x;
+    g_sharedHUDPosition.viewer_pos[1] = viewer_y;
+    g_sharedHUDPosition.viewer_pos[2] = viewer_z;
+    
+    g_sharedHUDPosition.upper_left[0] = ul_x;
+    g_sharedHUDPosition.upper_left[1] = ul_y;
+    g_sharedHUDPosition.upper_left[2] = ul_z;
+    
+    g_sharedHUDPosition.upper_right[0] = ur_x;
+    g_sharedHUDPosition.upper_right[1] = ur_y;
+    g_sharedHUDPosition.upper_right[2] = ur_z;
+    
+    g_sharedHUDPosition.lower_left[0] = ll_x;
+    g_sharedHUDPosition.lower_left[1] = ll_y;
+    g_sharedHUDPosition.lower_left[2] = ll_z;
+    
+    g_sharedHUDPosition.lower_right[0] = lr_x;
+    g_sharedHUDPosition.lower_right[1] = lr_y;
+    g_sharedHUDPosition.lower_right[2] = lr_z;
+    
+    g_sharedHUDPosition.is_custom_bounds = is_custom_bounds;
+    g_sharedHUDPosition.frame_number = frame_number;
+    g_sharedHUDPosition.world_scale = world_scale;
+    g_sharedHUDPosition.last_update_time = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    g_sharedHUDPosition.is_valid = true;
+    
+    static int updateCount = 0;
+    updateCount++;
+    
+    // Log occasionally to track updates
+    // if (updateCount % 60 == 1) {
+        dxvk::Logger::info(str::format("TF2VR: 📐 HUD POSITION UPDATE #", updateCount, 
+            " - Viewer: (", viewer_x, ", ", viewer_y, ", ", viewer_z, ")",
+            " - UL: (", ul_x, ", ", ul_y, ", ", ul_z, ")",
+            " - Custom: ", is_custom_bounds ? "true" : "false"));
+    // }
 }
 
 } // extern "C"
