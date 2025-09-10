@@ -550,10 +550,24 @@ bool OpenXRDirectMode::BeginFrame()
 	Logger::info("OpenXRDirectMode: BeginFrame called! Blocking until ready...");
 
 	// Use atomic operation with mutex+condition variable for frame synchronization
+	// Add timeout safeguard to prevent infinite loops during map transitions
+	auto timeoutStart = std::chrono::steady_clock::now();
+	const auto maxWaitTime = std::chrono::milliseconds(50);
+	int timeoutWarningCount = 0;
+	
 	while (m_bFrameRunning.load(std::memory_order_acquire)) {
 		std::unique_lock<std::mutex> lock(m_mutex);
 		if (m_frameCompletionEvent.wait_for(lock, std::chrono::milliseconds(16)) == std::cv_status::timeout) {
-			Logger::warn("OpenXRDirectMode: Waiting for previous frame completion");
+			timeoutWarningCount++;
+			Logger::warn(str::format("OpenXRDirectMode: Waiting for previous frame completion (", timeoutWarningCount, ")"));
+			
+			// Check if we've exceeded the maximum wait time
+			auto elapsed = std::chrono::steady_clock::now() - timeoutStart;
+			if (elapsed > maxWaitTime) {
+				Logger::err("OpenXRDirectMode: Frame completion timeout exceeded! Force-clearing frame state to prevent infinite loop.");
+				m_bFrameRunning.store(false, std::memory_order_release);
+				break;
+			}
 		}
 	}
 
