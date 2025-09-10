@@ -1778,6 +1778,13 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
+    // CRITICAL: Store frame state for input synchronization
+    // This ensures controller poses use the correct predicted display time
+    {
+        std::lock_guard<std::mutex> lock(m_frameStateMutex);
+        m_currentFrameState = frameState;
+    }
+    
     // No blocking here - TF2 should already be blocked from previous frame
     
     // Begin the frame
@@ -2578,6 +2585,11 @@ void VRCompositor::NotifyTF2FrameComplete() {
     Logger::info("VRCompositor: 📥 TF2 frame complete notification - will be unblocked after next VR frame");
     
     // No action needed here - TF2 will be unblocked after the next VR frame completes
+}
+
+XrTime VRCompositor::GetCurrentPredictedDisplayTime() const {
+    std::lock_guard<std::mutex> lock(m_frameStateMutex);
+    return m_currentFrameState.predictedDisplayTime;
 }
 
 } // namespace dxvk

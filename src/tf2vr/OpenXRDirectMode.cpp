@@ -1134,7 +1134,17 @@ bool OpenXRDirectMode::CopyToSwapchains()
 
 void OpenXRDirectMode::GetPredictedDisplayTime(XrTime& time)
 {
-	time = m_frameState.predictedDisplayTime;
+	// CRITICAL: When compositor is active, use the compositor's predicted display time
+	// This fixes the cursor lag caused by using stale frame state from the main pipeline
+	extern bool IsVRCompositorActive();
+	if (IsVRCompositorActive() && g_vrCompositor)
+	{
+		time = g_vrCompositor->GetCurrentPredictedDisplayTime();
+	}
+	else
+	{
+		time = m_frameState.predictedDisplayTime;
+	}
 }
 
 // Helper methods for command buffer management

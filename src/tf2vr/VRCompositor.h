@@ -185,8 +185,14 @@ public:
     std::atomic<bool> m_tf2CanRenderFrame{false};
     std::atomic<bool> m_tf2FrameReady{false};
     void NotifyTF2FrameComplete();
+    
+    // Get the current predicted display time for input synchronization
+    XrTime GetCurrentPredictedDisplayTime() const;
 
 private:
+    // Frame state for input synchronization
+    mutable std::mutex m_frameStateMutex;
+    XrFrameState m_currentFrameState;
     // Vulkan resource management
     bool CreateIndependentVulkanDevice();
     bool CreateCompositorSwapchains();
