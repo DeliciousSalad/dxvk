@@ -1503,12 +1503,43 @@ void VRCompositor::StopCompositor() {
     }
 }
 
+void VRCompositor::CheckAndUpdateHUDPosition() {
+    // Get the current HUD position data to check if it's been updated
+    SharedHUDPositionData hudPos = GetCurrentHUDPosition();
+    
+    // Check if the data is valid and newer than what we last processed
+    if (!hudPos.is_valid) {
+        return; // No valid data available
+    }
+    
+    // Track the last frame number we processed to detect updates
+    static int lastProcessedFrameNumber = -1;
+    
+    // If this is new data (different frame number), update the vertex buffer
+    if (hudPos.frame_number != lastProcessedFrameNumber) {
+        if (UpdateQuadFromGameHUD()) {
+            lastProcessedFrameNumber = hudPos.frame_number;
+            
+            // Log occasionally to show updates are working
+            static int updateCount = 0;
+            updateCount++;
+            if (updateCount <= 3 || updateCount % 60 == 1) {
+                Logger::info(str::format("VRCompositor: 🔄 Updated HUD position from game data (frame #", 
+                    hudPos.frame_number, ", update #", updateCount, ")"));
+            }
+        }
+    }
+}
+
 void VRCompositor::CompositorThreadFunc() {
     Logger::info("VRCompositor: 🧵 Compositor thread started");
     
     while (!m_shouldStop.load()) {
         // Check for and copy VGUI textures (safe polling)
         ::CheckAndCopyTrackedVGUITexture();
+        
+        // Check for updated HUD position data from game and update vertex buffer if needed
+        CheckAndUpdateHUDPosition();
         
         if (!RunIndependentFrame()) {
             Logger::warn("VRCompositor: Independent frame failed, minimal sleep");
@@ -1669,6 +1700,114 @@ bool VRCompositor::UpdateVertexBuffer() {
     return true;
 }
 
+bool VRCompositor::InitializeQuadWithPlayspaceCoordinates() {
+    Logger::info("VRCompositor: Initializing HUD quad with base playspace coordinates...");
+    
+    // Try to get position from game first (the game should have set up startup coordinates)
+    if (UpdateQuadFromGameHUD()) {
+        Logger::info("VRCompositor: ✅ HUD quad initialized using game-provided position data");
+        return true;
+    }
+    
+    Logger::warn("VRCompositor: No game HUD data available, using manual fallback setup");
+    
+    // Fallback - manual setup if no game data is available
+    // Use the same coordinate system and approach as the in-world positioning,
+    // but with default values suitable for menu/startup scenarios
+    
+    // Position the HUD quad in a comfortable viewing position
+    // These coordinates are in OpenXR playspace coordinates (meters)
+    // OpenXR typically has Y=0 at floor level, Z negative going forward
+    
+    // Default HUD positioning: 2.2m in front, at eye level, centered
+    float baseDistance = -2.2f;      // 2.2m in front of user (negative Z in OpenXR)
+    float eyeLevelHeight = 1.6f;     // 1.6m above floor (typical standing eye height)
+    float centerX = 0.0f;            // Centered horizontally
+    
+    // HUD dimensions: 16:9 aspect ratio, comfortable viewing size
+    float hudWidth = 1.8f;           // 1.8m wide (slightly smaller than the 2m fallback)
+    float hudHeight = 1.0125f;       // 1.0125m tall (maintains 16:9 ratio)
+    float halfWidth = hudWidth * 0.5f;
+    float halfHeight = hudHeight * 0.5f;
+    
+    // Calculate corner positions in playspace coordinates
+    // These match the same pattern as UpdateQuadFromGameHUD() uses
+    
+    // Lower-left corner
+    float ll_x = centerX - halfWidth;
+    float ll_y = eyeLevelHeight - halfHeight;  
+    float ll_z = baseDistance;
+    
+    // Lower-right corner  
+    float lr_x = centerX + halfWidth;
+    float lr_y = eyeLevelHeight - halfHeight;
+    float lr_z = baseDistance;
+    
+    // Upper-right corner
+    float ur_x = centerX + halfWidth;
+    float ur_y = eyeLevelHeight + halfHeight;
+    float ur_z = baseDistance;
+    
+    // Upper-left corner
+    float ul_x = centerX - halfWidth;
+    float ul_y = eyeLevelHeight + halfHeight;
+    float ul_z = baseDistance;
+    
+    // Set vertices using the same mapping as UpdateQuadFromGameHUD()
+    // This ensures consistency between startup and game-to-menu transitions
+    
+    // Bottom-left (corresponds to lower-left)
+    m_quadVertices[0].position[0] = ll_x;
+    m_quadVertices[0].position[1] = ll_y;
+    m_quadVertices[0].position[2] = ll_z;
+    m_quadVertices[0].texCoord[0] = 0.0f;
+    m_quadVertices[0].texCoord[1] = 0.0f;
+    m_quadVertices[0].color[0] = 1.0f;
+    m_quadVertices[0].color[1] = 1.0f;
+    m_quadVertices[0].color[2] = 1.0f;
+    
+    // Bottom-right (corresponds to lower-right)
+    m_quadVertices[1].position[0] = lr_x;
+    m_quadVertices[1].position[1] = lr_y;
+    m_quadVertices[1].position[2] = lr_z;
+    m_quadVertices[1].texCoord[0] = 1.0f;
+    m_quadVertices[1].texCoord[1] = 0.0f;
+    m_quadVertices[1].color[0] = 1.0f;
+    m_quadVertices[1].color[1] = 1.0f;
+    m_quadVertices[1].color[2] = 1.0f;
+    
+    // Top-right (corresponds to upper-right)
+    m_quadVertices[2].position[0] = ur_x;
+    m_quadVertices[2].position[1] = ur_y;
+    m_quadVertices[2].position[2] = ur_z;
+    m_quadVertices[2].texCoord[0] = 1.0f;
+    m_quadVertices[2].texCoord[1] = 1.0f;
+    m_quadVertices[2].color[0] = 1.0f;
+    m_quadVertices[2].color[1] = 1.0f;
+    m_quadVertices[2].color[2] = 1.0f;
+    
+    // Top-left (corresponds to upper-left)
+    m_quadVertices[3].position[0] = ul_x;
+    m_quadVertices[3].position[1] = ul_y;
+    m_quadVertices[3].position[2] = ul_z;
+    m_quadVertices[3].texCoord[0] = 0.0f;
+    m_quadVertices[3].texCoord[1] = 1.0f;
+    m_quadVertices[3].color[0] = 1.0f;
+    m_quadVertices[3].color[1] = 1.0f;
+    m_quadVertices[3].color[2] = 1.0f;
+    
+    // Update the GPU vertex buffer with the new positions
+    if (!UpdateVertexBuffer()) {
+        Logger::warn("VRCompositor: Failed to update vertex buffer during playspace initialization");
+        return false;
+    }
+    
+    Logger::info(str::format("VRCompositor: ✅ HUD quad initialized with playspace coordinates - ",
+        hudWidth, "x", hudHeight, "m at (", centerX, ", ", eyeLevelHeight, ", ", baseDistance, ")"));
+    
+    return true;
+}
+
 void VRCompositor::SetupQuadVertices() {
     // Try to get position from game first
     Logger::info("VRCompositor: SetupQuadVertices - attempting to get game HUD data...");
@@ -1678,9 +1817,17 @@ void VRCompositor::SetupQuadVertices() {
         return;
     }
     
-    // Fallback to default positioning if no game data available
-    Logger::warn("VRCompositor: ⚠️ No valid game HUD data, using fallback position");
-    // Create a quad positioned 2.5 meters in front of the user
+    // Initialize using proper playspace coordinates instead of simple fallback
+    Logger::info("VRCompositor: No game HUD data available, initializing with playspace coordinates...");
+    if (InitializeQuadWithPlayspaceCoordinates()) {
+        Logger::info("VRCompositor: ✅ HUD quad initialized using base playspace coordinates");
+        return;
+    }
+    
+    // Final fallback to the original simple positioning if playspace init fails
+    Logger::warn("VRCompositor: ⚠️ Playspace initialization failed, using basic fallback position");
+    
+    // Create a quad positioned 2.5 meters in front of the user (original fallback)
     // Size: 2m wide x 1.125m tall (16:9 aspect ratio)
     float halfWidth = 1.0f;   // 2m wide (16 units)
     float halfHeight = 0.5625f; // 1.125m tall (9 units) = 16:9 ratio
@@ -1691,12 +1838,17 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[0].position[1] = -halfHeight;
     m_quadVertices[0].position[2] = distance;
     m_quadVertices[0].texCoord[0] = 0.0f;
-    m_quadVertices[0].texCoord[1] = 0.0f; // Fixed: Bottom should be 0.0f, not 1.0f
-    m_quadVertices[0].color[0] = 1.0f; // White for proper texture rendering
+    m_quadVertices[0].texCoord[1] = 0.0f;
+    m_quadVertices[0].color[0] = 1.0f;
     m_quadVertices[0].color[1] = 1.0f;
     m_quadVertices[0].color[2] = 1.0f;
+    
+    // Bottom-right
+    m_quadVertices[1].position[0] = halfWidth;
+    m_quadVertices[1].position[1] = -halfHeight;
+    m_quadVertices[1].position[2] = distance;
     m_quadVertices[1].texCoord[0] = 1.0f;
-    m_quadVertices[1].texCoord[1] = 0.0f; // Fixed: Bottom should be 0.0f, not 1.0f
+    m_quadVertices[1].texCoord[1] = 0.0f;
     m_quadVertices[1].color[0] = 1.0f;
     m_quadVertices[1].color[1] = 1.0f;
     m_quadVertices[1].color[2] = 1.0f;
@@ -1706,7 +1858,7 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[2].position[1] = halfHeight;
     m_quadVertices[2].position[2] = distance;
     m_quadVertices[2].texCoord[0] = 1.0f;
-    m_quadVertices[2].texCoord[1] = 1.0f; // Fixed: Top should be 1.0f, not 0.0f
+    m_quadVertices[2].texCoord[1] = 1.0f;
     m_quadVertices[2].color[0] = 1.0f;
     m_quadVertices[2].color[1] = 1.0f;
     m_quadVertices[2].color[2] = 1.0f;
@@ -1716,7 +1868,7 @@ void VRCompositor::SetupQuadVertices() {
     m_quadVertices[3].position[1] = halfHeight;
     m_quadVertices[3].position[2] = distance;
     m_quadVertices[3].texCoord[0] = 0.0f;
-    m_quadVertices[3].texCoord[1] = 1.0f; // Fixed: Top should be 1.0f, not 0.0f
+    m_quadVertices[3].texCoord[1] = 1.0f;
     m_quadVertices[3].color[0] = 1.0f;
     m_quadVertices[3].color[1] = 1.0f;
     m_quadVertices[3].color[2] = 1.0f;
@@ -1724,7 +1876,7 @@ void VRCompositor::SetupQuadVertices() {
     // Update the GPU vertex buffer with the default positions
     UpdateVertexBuffer();
     
-    Logger::info("VRCompositor: ✅ Quad vertices set up - white 2x1.125m quad (16:9) at 2.5m distance");
+    Logger::info("VRCompositor: ✅ Quad vertices set up - basic fallback 2x1.125m quad (16:9) at 2.5m distance");
 }
 
 void VRCompositor::SetupMVPMatrix() {

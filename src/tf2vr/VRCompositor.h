@@ -248,6 +248,8 @@ private:
     
     // HUD Position Management
     bool UpdateQuadFromGameHUD();
+    void CheckAndUpdateHUDPosition();               // Check for updated HUD position data and update vertices
+    bool InitializeQuadWithPlayspaceCoordinates();  // Initialize HUD quad using base playspace coordinates
     bool UpdateVertexBuffer();  // Update GPU vertex buffer with current m_quadVertices
     
     // Compositor thread management
