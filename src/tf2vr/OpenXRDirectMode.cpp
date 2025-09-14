@@ -87,6 +87,7 @@ void MatrixTranspose(float src[4][4], float dst[4][4])
 OpenXRDirectMode::OpenXRDirectMode()
 	: m_nRenderWidth(1440)
 	, m_nRenderHeight(1600)
+	, m_nMSAA(4)
 	, m_instance(XR_NULL_HANDLE)
 	, m_session(XR_NULL_HANDLE)
 	, m_referenceSpace(nullptr)
@@ -2263,5 +2264,10 @@ void TF2VR_NotifyVGUIFrameComplete() {
     }
 }
 
-
+int OpenXRDirectMode::DetermineMSAA(uint32_t width, uint32_t height) {
+	if (width == m_nRenderWidth && height == m_nRenderHeight) {
+	  return m_nMSAA;
+	}
+	return 0;
+}
 

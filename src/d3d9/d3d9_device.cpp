@@ -19,6 +19,7 @@
 
 #include "../dxvk/dxvk_adapter.h"
 #include "../tf2vr/hmdWrapper.h"
+#include "../tf2vr/OpenXRDirectMode.h"
 
 // Forward declaration for VGUI tracking function
 extern "C" void TF2VR_TrackVGUIRenderTarget(dxvk::D3D9Surface* surface, dxvk::D3D9CommonTexture* texture);
@@ -651,7 +652,8 @@ namespace dxvk {
     desc.Format             = EnumerateFormat(Format);
     desc.Pool               = Pool;
     desc.Discard            = FALSE;
-    desc.MultiSample        = D3DMULTISAMPLE_NONE;
+    // desc.MultiSample        = D3DMULTISAMPLE_NONE;
+    desc.MultiSample        = (D3DMULTISAMPLE_TYPE)OpenXRDirectMode::Get()->DetermineMSAA(Width, Height);
     desc.MultisampleQuality = 0;
     desc.IsBackBuffer       = FALSE;
     desc.IsAttachmentOnly   = FALSE;
@@ -4302,7 +4304,7 @@ namespace dxvk {
     desc.Format             = EnumerateFormat(Format);
     desc.Pool               = D3DPOOL_DEFAULT;
     desc.Discard            = Discard;
-    desc.MultiSample        = MultiSample;
+    desc.MultiSample        = std::max(MultiSample, (D3DMULTISAMPLE_TYPE)OpenXRDirectMode::Get()->DetermineMSAA(Width, Height));
     desc.MultisampleQuality = MultisampleQuality;
     desc.IsBackBuffer       = FALSE;
     desc.IsAttachmentOnly   = TRUE;

@@ -197,6 +197,7 @@ private:
 	bool WaitPoses();
 
 	virtual void SetRenderTextureSize(uint32_t width, uint32_t height, int msaa);
+	virtual int DetermineMSAA(uint32_t width, uint32_t height);
 
 	// Command buffer management
 	VkCommandPool m_persistentCommandPool = VK_NULL_HANDLE;

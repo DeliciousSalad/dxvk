@@ -10,8 +10,9 @@ HMDInterface *g_pHMDInterface = NULL;
 
 HMDInterface* HMDInterface::Get()
 {
-	g_pHMDInterface = new OpenXRDirectMode();
-
+	if (g_pHMDInterface == NULL) {
+		g_pHMDInterface = new OpenXRDirectMode();
+	}
 	return g_pHMDInterface;
 }
 

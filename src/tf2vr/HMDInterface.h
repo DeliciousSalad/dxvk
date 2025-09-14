@@ -43,6 +43,7 @@ public:
 	virtual void GetViews(XrView*& views, XrSpaceLocation& headLocation, uint32_t& viewCount) = 0;
 
 	virtual void StoreSharedTexture(int index, VulkanTextureData* vulkanData) = 0;
+	virtual int DetermineMSAA(uint32_t width, uint32_t height) = 0;
 
 	virtual void SetRenderTextureSize(uint32_t width, uint32_t height, int msaa) = 0;
 	virtual void OnRenderTargetChanged(dxvk::Rc<dxvk::DxvkDevice> device, dxvk::D3D9Surface* rt) = 0;
