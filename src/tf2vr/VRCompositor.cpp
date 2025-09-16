@@ -2143,11 +2143,13 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
             Logger::info(str::format("VRCompositor: Eye ", eye, " - Using PERSISTENT VGUI texture to prevent flicker (frame #", persistentFrameCount, ")"));
         }
     } else {
-        // Only use fallback if we've NEVER had a VGUI texture
-        static int fallbackFrameCount = 0;
-        if ((++fallbackFrameCount % 60) == 1) {
-            Logger::info(str::format("VRCompositor: Eye ", eye, " - Using FALLBACK texture (waiting for first VGUI) (frame #", fallbackFrameCount, ")"));
+        // Don't render the quad until we receive the first texture update
+        static int waitingFrameCount = 0;
+        if ((++waitingFrameCount % 60) == 1) {
+            Logger::info(str::format("VRCompositor: Eye ", eye, " - WAITING for first VGUI texture, skipping quad render (frame #", waitingFrameCount, ")"));
         }
+        // Early return - don't render the quad
+        return;
     }
     
     // Update descriptor set for this frame
