@@ -142,6 +142,13 @@ private:
     VkDeviceMemory m_fallbackTextureMemory = VK_NULL_HANDLE;
     VkImageView m_fallbackTextureView = VK_NULL_HANDLE;
     
+    // Rounded corner mask texture
+    VkImage m_maskTexture = VK_NULL_HANDLE;
+    VkDeviceMemory m_maskTextureMemory = VK_NULL_HANDLE;
+    VkImageView m_maskTextureView = VK_NULL_HANDLE;
+    VkSampler m_maskTextureSampler = VK_NULL_HANDLE;
+    bool m_maskTextureLoaded = false;
+    
     // Frame submission data
     struct FrameData {
         void* textureHandle = nullptr;
@@ -213,6 +220,8 @@ private:
     bool CreateTextureSampler();
     bool CreateSimpleFallbackTexture();
     bool CreateGraphicsPipeline();
+    bool LoadMaskTexture(const char* pngPath);
+    bool CreateMaskTextureFromPNG(const unsigned char* pngData, int width, int height);
     
 
     
@@ -245,6 +254,7 @@ private:
     
     // Texture management
     void UpdateDescriptorSetWithTexture(VkImageView textureView);
+    void UpdateDescriptorSetWithTextures(VkImageView mainTextureView, VkImageView maskTextureView);
     
     // HUD Position Management
     bool UpdateQuadFromGameHUD();

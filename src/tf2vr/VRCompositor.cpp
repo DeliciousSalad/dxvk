@@ -7,6 +7,11 @@
 #include <tf2vr_vr_quad_frag.h>
 #include <tf2vr_vr_quad_vert.h>
 #include <chrono>
+#include <fstream>
+#include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 // Forward declare what we need from OpenXRDirectMode
 class OpenXRDirectMode;
@@ -146,6 +151,24 @@ void VRCompositor::CleanupVulkanResources() {
     if (m_fallbackTextureView != VK_NULL_HANDLE) {
         vkDestroyImageView(m_compositorDevice, m_fallbackTextureView, nullptr);
         m_fallbackTextureView = VK_NULL_HANDLE;
+    }
+    
+    // Cleanup mask texture
+    if (m_maskTextureView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_compositorDevice, m_maskTextureView, nullptr);
+        m_maskTextureView = VK_NULL_HANDLE;
+    }
+    if (m_maskTexture != VK_NULL_HANDLE) {
+        vkDestroyImage(m_compositorDevice, m_maskTexture, nullptr);
+        m_maskTexture = VK_NULL_HANDLE;
+    }
+    if (m_maskTextureMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_compositorDevice, m_maskTextureMemory, nullptr);
+        m_maskTextureMemory = VK_NULL_HANDLE;
+    }
+    if (m_maskTextureSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_compositorDevice, m_maskTextureSampler, nullptr);
+        m_maskTextureSampler = VK_NULL_HANDLE;
     }
     
     // Cleanup command resources
@@ -2099,9 +2122,27 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
         memcpy(mvpMatrix, identityMatrix, sizeof(mvpMatrix));
     }
     
-    // Push MVP matrix as push constant
-    const size_t mvpMatrixSize = 16 * sizeof(float); // 4x4 matrix = 64 bytes
-    vkCmdPushConstants(m_compositorCommandBuffer, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, mvpMatrixSize, mvpMatrix);
+    // Push MVP matrix and shader parameters as push constants
+    struct PushConstants {
+        float mvpMatrix[16];     // 64 bytes
+        float hasAlphaMask;      // 4 bytes
+        float fullOpacity;       // 4 bytes
+        float padding1;          // 4 bytes
+        float padding2;          // 4 bytes
+    } pushConstants;
+    
+    // Copy MVP matrix
+    memcpy(pushConstants.mvpMatrix, mvpMatrix, sizeof(float) * 16);
+    
+    // Set shader parameters
+    pushConstants.hasAlphaMask = m_maskTextureLoaded ? 1.0f : 0.0f;
+    pushConstants.fullOpacity = 0.0f; // Use normal blending mode (not full opacity cutout)
+    pushConstants.padding1 = 0.0f;
+    pushConstants.padding2 = 0.0f;
+    
+    vkCmdPushConstants(m_compositorCommandBuffer, m_pipelineLayout, 
+                      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 
+                      0, sizeof(pushConstants), &pushConstants);
     
     // AGGRESSIVE ANTI-FLICKER: Once we get ANY VGUI texture, never go back to fallback
     static VkImageView persistentVGUITexture = VK_NULL_HANDLE;
@@ -2152,8 +2193,8 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
         return;
     }
     
-    // Update descriptor set for this frame
-    UpdateDescriptorSetWithTexture(textureToUse);
+    // Update descriptor set for this frame (main texture + mask texture)
+    UpdateDescriptorSetWithTextures(textureToUse, m_maskTextureLoaded ? m_maskTextureView : m_fallbackTextureView);
     
     // Bind descriptor set for texture sampling
     vkCmdBindDescriptorSets(m_compositorCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, 
@@ -2272,11 +2313,42 @@ bool VRCompositor::CreateWorkingVulkanPipeline() {
         return false;
     }
     
-    // Create pipeline layout with push constants for MVP matrix
+    // Load the rounded corner mask texture - try multiple possible paths
+    const char* maskPaths[] = {
+        "tfvr/materials/vgui/rounded_corner_mask.png",
+    };
+    
+    bool maskLoaded = false;
+    for (const char* path : maskPaths) {
+        if (LoadMaskTexture(path)) {
+            maskLoaded = true;
+            break;
+        }
+    }
+    
+    if (!maskLoaded) {
+        Logger::warn("VRCompositor: Failed to load mask texture from any path, creating fallback white mask");
+        
+        // Create a fallback white mask texture (no masking effect)
+        const int fallbackWidth = 256;
+        const int fallbackHeight = 256;
+        const size_t fallbackDataSize = fallbackWidth * fallbackHeight * 4;
+        std::vector<uint8_t> whiteTextureData(fallbackDataSize, 255);
+        
+        if (CreateMaskTextureFromPNG(whiteTextureData.data(), fallbackWidth, fallbackHeight)) {
+            m_maskTextureLoaded = true;
+            Logger::info("VRCompositor: ✅ Fallback white mask texture created (rounded corners disabled)");
+        } else {
+            Logger::err("VRCompositor: Failed to create fallback mask texture");
+            m_maskTextureLoaded = false;
+        }
+    }
+    
+    // Create pipeline layout with push constants for MVP matrix + shader params
     VkPushConstantRange pushConstantRange = {};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(float) * 16; // 4x4 matrix
+    pushConstantRange.size = sizeof(float) * 20; // 4x4 matrix (64 bytes) + 4 shader params (16 bytes) = 80 bytes
     
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     pipelineLayoutInfo.setLayoutCount = 1;
@@ -2441,17 +2513,26 @@ bool VRCompositor::CreateTextureSampler() {
 bool VRCompositor::CreateDescriptorResources() {
     Logger::info("VRCompositor: Creating descriptor resources...");
     
-    // Create descriptor set layout
-    VkDescriptorSetLayoutBinding samplerLayoutBinding = {};
-    samplerLayoutBinding.binding = 0;
-    samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    samplerLayoutBinding.descriptorCount = 1;
-    samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    samplerLayoutBinding.pImmutableSamplers = nullptr;
+    // Create descriptor set layout for both textures (main texture + mask texture)
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    
+    // Binding 0: Main VGUI texture sampler
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[0].pImmutableSamplers = nullptr;
+    
+    // Binding 1: Alpha mask texture sampler  
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].pImmutableSamplers = nullptr;
     
     VkDescriptorSetLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = 1;
-    layoutInfo.pBindings = &samplerLayoutBinding;
+    layoutInfo.bindingCount = 2;
+    layoutInfo.pBindings = bindings;
     
     VkResult result = vkCreateDescriptorSetLayout(m_compositorDevice, &layoutInfo, nullptr, &m_descriptorSetLayout);
     if (result != VK_SUCCESS) {
@@ -2459,10 +2540,10 @@ bool VRCompositor::CreateDescriptorResources() {
         return false;
     }
     
-    // Create descriptor pool
+    // Create descriptor pool for both texture samplers
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 1;
+    poolSize.descriptorCount = 2; // Now we need 2 samplers
     
     VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.poolSizeCount = 1;
@@ -2687,21 +2768,8 @@ bool VRCompositor::CreateSimpleFallbackTexture() {
         return false;
     }
     
-    // Update descriptor set to use the fallback texture
-    VkDescriptorImageInfo imageInfo2 = {};
-    imageInfo2.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfo2.imageView = m_fallbackTextureView;
-    imageInfo2.sampler = m_textureSampler;
-    
-    VkWriteDescriptorSet descriptorWrite = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    descriptorWrite.dstSet = m_descriptorSet;
-    descriptorWrite.dstBinding = 0;
-    descriptorWrite.dstArrayElement = 0;
-    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    descriptorWrite.descriptorCount = 1;
-    descriptorWrite.pImageInfo = &imageInfo2;
-    
-    vkUpdateDescriptorSets(m_compositorDevice, 1, &descriptorWrite, 0, nullptr);
+    // Update descriptor set to use the fallback texture initially for both bindings
+    UpdateDescriptorSetWithTextures(m_fallbackTextureView, m_fallbackTextureView);
     
     Logger::info("VRCompositor: ✅ Bright green fallback texture created with proper data upload and descriptor set updated");
     return true;
@@ -2732,6 +2800,50 @@ void VRCompositor::UpdateDescriptorSetWithTexture(VkImageView textureView) {
     Logger::info("VRCompositor: ✅ Descriptor set updated with new texture");
 }
 
+void VRCompositor::UpdateDescriptorSetWithTextures(VkImageView mainTextureView, VkImageView maskTextureView) {
+    if (mainTextureView == VK_NULL_HANDLE || maskTextureView == VK_NULL_HANDLE) {
+        Logger::warn("VRCompositor: Cannot update descriptor set with null texture views");
+        return;
+    }
+    
+    // Update descriptor set to use both textures
+    VkDescriptorImageInfo imageInfos[2] = {};
+    
+    // Binding 0: Main VGUI texture
+    imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfos[0].imageView = mainTextureView;
+    imageInfos[0].sampler = m_textureSampler;
+    
+    // Binding 1: Mask texture
+    imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfos[1].imageView = maskTextureView;
+    imageInfos[1].sampler = m_maskTextureLoaded ? m_maskTextureSampler : m_textureSampler;
+    
+    VkWriteDescriptorSet descriptorWrites[2] = {};
+    
+    // Write for main texture (binding 0)
+    descriptorWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    descriptorWrites[0].dstSet = m_descriptorSet;
+    descriptorWrites[0].dstBinding = 0;
+    descriptorWrites[0].dstArrayElement = 0;
+    descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrites[0].descriptorCount = 1;
+    descriptorWrites[0].pImageInfo = &imageInfos[0];
+    
+    // Write for mask texture (binding 1)
+    descriptorWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    descriptorWrites[1].dstSet = m_descriptorSet;
+    descriptorWrites[1].dstBinding = 1;
+    descriptorWrites[1].dstArrayElement = 0;
+    descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrites[1].descriptorCount = 1;
+    descriptorWrites[1].pImageInfo = &imageInfos[1];
+    
+    vkUpdateDescriptorSets(m_compositorDevice, 2, descriptorWrites, 0, nullptr);
+    
+    Logger::info("VRCompositor: ✅ Descriptor set updated with main and mask textures");
+}
+
 void VRCompositor::NotifyTF2FrameComplete() {
     // This is called when TF2 finishes a frame and is blocked in PostPresentCallback
     // The VR compositor will unblock TF2 after completing its next frame
@@ -2744,6 +2856,232 @@ void VRCompositor::NotifyTF2FrameComplete() {
 XrTime VRCompositor::GetCurrentPredictedDisplayTime() const {
     std::lock_guard<std::mutex> lock(m_frameStateMutex);
     return m_currentFrameState.predictedDisplayTime;
+}
+
+bool VRCompositor::LoadMaskTexture(const char* pngPath) {
+    Logger::info(str::format("VRCompositor: Loading mask texture from: ", pngPath));
+    
+    // Load PNG using stb_image
+    int width, height, channels;
+    unsigned char* imageData = stbi_load(pngPath, &width, &height, &channels, STBI_rgb_alpha);
+    
+    if (!imageData) {
+        Logger::info(str::format("VRCompositor: Could not load PNG from: ", pngPath, " (", stbi_failure_reason(), ")"));
+        return false; // Don't create fallback here, let the caller handle it
+    }
+    
+    Logger::info(str::format("VRCompositor: PNG loaded successfully - dimensions: ", width, "x", height, " channels: ", channels));
+    
+    // Create texture from loaded PNG data
+    bool success = CreateMaskTextureFromPNG(imageData, width, height);
+    
+    // Free the loaded image data
+    stbi_image_free(imageData);
+    
+    if (success) {
+        m_maskTextureLoaded = true;
+        Logger::info("VRCompositor: ✅ Mask texture loaded and created successfully - rounded corners enabled!");
+    }
+    
+    return success;
+}
+
+bool VRCompositor::CreateMaskTextureFromPNG(const unsigned char* pngData, int width, int height) {
+    Logger::info(str::format("VRCompositor: Creating mask texture from PNG data - size: ", width, "x", height));
+    
+    VkDeviceSize imageSize = width * height * 4; // RGBA
+    
+    // Create staging buffer first to upload texture data
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingBufferMemory;
+    
+    VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.size = imageSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    VkResult result = vkCreateBuffer(m_compositorDevice, &bufferInfo, nullptr, &stagingBuffer);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create staging buffer for mask texture - error: ", result));
+        return false;
+    }
+    
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(m_compositorDevice, stagingBuffer, &memRequirements);
+    
+    VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    result = vkAllocateMemory(m_compositorDevice, &allocInfo, nullptr, &stagingBufferMemory);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate staging buffer memory for mask texture - error: ", result));
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        return false;
+    }
+    
+    vkBindBufferMemory(m_compositorDevice, stagingBuffer, stagingBufferMemory, 0);
+    
+    // Upload PNG data to staging buffer
+    void* data;
+    vkMapMemory(m_compositorDevice, stagingBufferMemory, 0, imageSize, 0, &data);
+    memcpy(data, pngData, static_cast<size_t>(imageSize));
+    vkUnmapMemory(m_compositorDevice, stagingBufferMemory);
+    
+    // Create image
+    VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    result = vkCreateImage(m_compositorDevice, &imageInfo, nullptr, &m_maskTexture);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create mask texture image - error: ", result));
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+        return false;
+    }
+    
+    // Allocate memory for image
+    VkMemoryRequirements imgMemRequirements;
+    vkGetImageMemoryRequirements(m_compositorDevice, m_maskTexture, &imgMemRequirements);
+    
+    VkMemoryAllocateInfo imgAllocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    imgAllocInfo.allocationSize = imgMemRequirements.size;
+    imgAllocInfo.memoryTypeIndex = FindMemoryType(imgMemRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    result = vkAllocateMemory(m_compositorDevice, &imgAllocInfo, nullptr, &m_maskTextureMemory);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to allocate mask texture memory - error: ", result));
+        vkDestroyImage(m_compositorDevice, m_maskTexture, nullptr);
+        vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+        vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+        return false;
+    }
+    
+    vkBindImageMemory(m_compositorDevice, m_maskTexture, m_maskTextureMemory, 0);
+    
+    // Copy staging buffer to image (need command buffer for this)
+    VkCommandBufferAllocateInfo cmdAllocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandPool = m_compositorCommandPool;
+    cmdAllocInfo.commandBufferCount = 1;
+    
+    VkCommandBuffer commandBuffer;
+    vkAllocateCommandBuffers(m_compositorDevice, &cmdAllocInfo, &commandBuffer);
+    
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    
+    // Transition image layout to transfer destination
+    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_maskTexture;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    
+    // Copy buffer to image
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = { 0, 0, 0 };
+    region.imageExtent = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 };
+    
+    vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, m_maskTexture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    
+    // Transition image layout to shader read-only
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    
+    vkEndCommandBuffer(commandBuffer);
+    
+    // Submit command buffer
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    
+    vkQueueSubmit(m_compositorQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_compositorQueue);
+    
+    // Cleanup staging resources
+    vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &commandBuffer);
+    vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
+    vkFreeMemory(m_compositorDevice, stagingBufferMemory, nullptr);
+    
+    // Create image view
+    VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    viewInfo.image = m_maskTexture;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+    
+    result = vkCreateImageView(m_compositorDevice, &viewInfo, nullptr, &m_maskTextureView);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create mask texture view - error: ", result));
+        return false;
+    }
+    
+    // Create sampler for mask texture
+    VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_WHITE;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    
+    result = vkCreateSampler(m_compositorDevice, &samplerInfo, nullptr, &m_maskTextureSampler);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to create mask texture sampler - error: ", result));
+        return false;
+    }
+    
+    Logger::info("VRCompositor: ✅ Mask texture created successfully");
+    return true;
 }
 
 } // namespace dxvk
