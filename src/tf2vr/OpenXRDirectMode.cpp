@@ -649,17 +649,20 @@ bool OpenXRDirectMode::EndFrame()
 	
 	if (validViews) 
 	{
-		// Build the projection views
-		for (uint32_t i = 0; i < m_views.size() && i < m_eyeSwapchains.size(); i++) {
-			const SwapchainInfo& swapchain = m_eyeSwapchains[i];
+		// Build the projection views - both eyes use same swapchain with different imageRect
+		const SwapchainInfo& swapchain = m_eyeSwapchains[0];
+		uint32_t perEyeWidth = swapchain.width / m_views.size();  // Half width per eye
+		
+		for (uint32_t i = 0; i < m_views.size(); i++) {
 			XrCompositionLayerProjectionView& projectionView = m_projectionViews[i];
 			
 			projectionView.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 			projectionView.pose = m_views[i].pose;
 			projectionView.fov = m_views[i].fov;
-			projectionView.subImage.swapchain = swapchain.handle;
-			projectionView.subImage.imageRect.offset = {0, 0};
-			projectionView.subImage.imageRect.extent = {(int32_t)swapchain.width, (int32_t)swapchain.height};
+			projectionView.subImage.swapchain = swapchain.handle;  // Same swapchain!
+			projectionView.subImage.imageRect.offset = {(int32_t)(i * perEyeWidth), 0};  // Left=0, Right=perEyeWidth
+			projectionView.subImage.imageRect.extent = {(int32_t)perEyeWidth, (int32_t)swapchain.height};
+			projectionView.subImage.imageArrayIndex = 0;
 		}
 	} else {
 		Logger::warn("OpenXRDirectMode: Views not valid, using default projection");
@@ -675,12 +678,8 @@ bool OpenXRDirectMode::EndFrame()
 		if (!m_projectionViews.empty() && !m_eyeSwapchains.empty()) {
 			XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 			layer.space = m_referenceSpace;
-			// Calculate view count as the minimum of projection views and swapchain count
-			uint32_t viewCount = static_cast<uint32_t>(m_projectionViews.size());
-			if (m_eyeSwapchains.size() < m_projectionViews.size()) {
-				viewCount = static_cast<uint32_t>(m_eyeSwapchains.size());
-			}
-			layer.viewCount = viewCount;
+			// Use all projection views (both eyes reference the same swapchain)
+			layer.viewCount = static_cast<uint32_t>(m_projectionViews.size());
 			layer.views = m_projectionViews.data();
 			layers[0] = (XrCompositionLayerBaseHeader*)&layer;
 			layerCount = 1;
@@ -903,26 +902,34 @@ bool OpenXRDirectMode::CreateEyeSwapchains()
 		m_projectionViews[i].next = nullptr;
 	}
 
-	for (uint32_t i = 0; i < viewCount; i++) {
-		SwapchainInfo& swapchainInfo = m_eyeSwapchains[i];
-		swapchainInfo.width = swapchainWidth;
-		swapchainInfo.height = swapchainHeight;
-		swapchainInfo.format = targetFormat;
+	// OPTIMIZATION: Create ONE swapchain for both eyes using side-by-side layout
+	// Each eye will use imageRect to reference its half of the swapchain
+	m_eyeSwapchains.resize(1);
+	
+	SwapchainInfo& swapchainInfo = m_eyeSwapchains[0];
+	swapchainInfo.width = swapchainWidth * viewCount;  // Full side-by-side width (2x)
+	swapchainInfo.height = swapchainHeight;
+	swapchainInfo.format = targetFormat;
 
-		XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-		createInfo.createFlags = 0;
-		createInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-		createInfo.format = targetFormat;
-		createInfo.sampleCount = 1;
-		createInfo.width = swapchainInfo.width;
-		createInfo.height = swapchainInfo.height;
-		createInfo.faceCount = 1;
-		createInfo.arraySize = 1;
-		createInfo.mipCount = 1;
+	XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	createInfo.createFlags = 0;
+	createInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	createInfo.format = targetFormat;
+	createInfo.sampleCount = 1;
+	createInfo.width = swapchainInfo.width;   // Full width (both eyes)
+	createInfo.height = swapchainInfo.height;
+	createInfo.faceCount = 1;
+	createInfo.arraySize = 1;
+	createInfo.mipCount = 1;
+	
+	Logger::info(str::format("OpenXRDirectMode: Creating single side-by-side swapchain: ", 
+		swapchainInfo.width, "x", swapchainInfo.height, " (", swapchainWidth, " per eye)"));
 
+	{
+		uint32_t i = 0;
 		result = xrCreateSwapchain(m_session, &createInfo, &swapchainInfo.handle);
 		if (XR_FAILED(result)) {
-			Logger::err(str::format("OpenXRDirectMode: Failed to create swapchain for view ", i, " - error: ", (int)result));
+			Logger::err(str::format("OpenXRDirectMode: Failed to create swapchain - error: ", (int)result));
 			return false;
 		}
 
@@ -982,145 +989,107 @@ bool OpenXRDirectMode::CopyToSwapchains()
 		return false;
 	}
 
-	// Batch all image barriers for better performance
-	std::vector<VkImageMemoryBarrier> preBarriers;
-	std::vector<VkImageMemoryBarrier> postBarriers;
-	std::vector<VkImageCopy> copyRegions;
-	std::vector<std::pair<XrSwapchain, uint32_t>> swapchainReleaseQueue;
+	// OPTIMIZATION: Single swapchain = ONE copy of full side-by-side texture!
+	SwapchainInfo& swapchainInfo = m_eyeSwapchains[0];
+	SharedTextureData& srcData = m_sharedTextures[0];
 
-	preBarriers.reserve(m_eyeSwapchains.size());
-	postBarriers.reserve(m_eyeSwapchains.size());
-	copyRegions.reserve(m_eyeSwapchains.size());
-	swapchainReleaseQueue.reserve(m_eyeSwapchains.size());
-
-	// First, acquire all swapchain images
-	for (uint32_t eyeIndex = 0; eyeIndex < m_eyeSwapchains.size(); eyeIndex++) {
-		SwapchainInfo& swapchainInfo = m_eyeSwapchains[eyeIndex];
-		
-		uint32_t swapchainImageIndex;
-		XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-		XrResult result = xrAcquireSwapchainImage(swapchainInfo.handle, &acquireInfo, &swapchainImageIndex);
-		if (XR_FAILED(result)) {
-			Logger::err(str::format("OpenXRDirectMode: Failed to acquire swapchain image for eye ", eyeIndex));
-			continue;
-		}
-
-		// Wait for the image to be ready
-		XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-		waitInfo.timeout = 8333333; // ~8.3ms timeout (1 frame at 120fps)
-		result = xrWaitSwapchainImage(swapchainInfo.handle, &waitInfo);
-		if (XR_FAILED(result)) {
-			Logger::err(str::format("OpenXRDirectMode: Failed to wait for swapchain image for eye ", eyeIndex));
-			continue;
-		}
-
-		VkImage dstImage = m_eyeSwapchains[eyeIndex].images[swapchainImageIndex].image.image;
-		uint32_t sharedTextureIndex = (m_sharedTextures.size() == 1) ? 0 : eyeIndex;
-		
-		if (sharedTextureIndex >= m_sharedTextures.size()) {
-			Logger::err(str::format("OpenXRDirectMode: No shared texture available for eye ", eyeIndex));
-			continue;
-		}
-		else{
-			Logger::info(str::format("OpenXRDirectMode: Swapchain image index: ", swapchainImageIndex));
-		}
-		
-		SharedTextureData& srcData = m_sharedTextures[sharedTextureIndex];
-		
-		// Set up pre-copy barrier
-		VkImageMemoryBarrier preBarrier = {};
-		preBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		preBarrier.srcAccessMask = 0;
-		preBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		preBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		preBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		preBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		preBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		preBarrier.image = dstImage;
-		preBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		preBarrier.subresourceRange.baseMipLevel = 0;
-		preBarrier.subresourceRange.levelCount = 1;
-		preBarrier.subresourceRange.baseArrayLayer = 0;
-		preBarrier.subresourceRange.layerCount = 1;
-		
-		// Set up post-copy barrier
-		VkImageMemoryBarrier postBarrier = preBarrier;
-		postBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		postBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-		postBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		postBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-		// Set up copy region
-		VkImageCopy copyRegion = {};
-		copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copyRegion.srcSubresource.mipLevel = 0;
-		copyRegion.srcSubresource.baseArrayLayer = 0;
-		copyRegion.srcSubresource.layerCount = 1;
-		copyRegion.dstSubresource = copyRegion.srcSubresource;
-		
-		if (m_sharedTextures.size() == 1 && srcData.width >= swapchainInfo.width * 2) {
-			copyRegion.srcOffset = {static_cast<int32_t>(eyeIndex * swapchainInfo.width), 0, 0};
-			copyRegion.extent = {swapchainInfo.width, swapchainInfo.height, 1};
-		} else {
-			copyRegion.srcOffset = {0, 0, 0};
-			copyRegion.extent = {srcData.width, srcData.height, 1};
-		}
-		copyRegion.dstOffset = {0, 0, 0};
-
-		preBarriers.push_back(preBarrier);
-		postBarriers.push_back(postBarrier);
-		copyRegions.push_back(copyRegion);
-		swapchainReleaseQueue.push_back({swapchainInfo.handle, swapchainImageIndex});
+	// Acquire the single swapchain image
+	uint32_t swapchainImageIndex;
+	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	XrResult result = xrAcquireSwapchainImage(swapchainInfo.handle, &acquireInfo, &swapchainImageIndex);
+	if (XR_FAILED(result)) {
+		Logger::err("OpenXRDirectMode: Failed to acquire swapchain image");
+		return false;
 	}
 
-	// Batch all pre-copy barriers
-	if (!preBarriers.empty()) {
-		vkCmdPipelineBarrier(cmdBuffer,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			0,
-			0, nullptr,
-			0, nullptr,
-			preBarriers.size(), preBarriers.data());
+	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	waitInfo.timeout = 8333333;
+	result = xrWaitSwapchainImage(swapchainInfo.handle, &waitInfo);
+	if (XR_FAILED(result)) {
+		Logger::err("OpenXRDirectMode: Failed to wait for swapchain image");
+		return false;
 	}
 
-	// Perform all copies
-	for (size_t i = 0; i < copyRegions.size(); i++) {
-		uint32_t sharedTextureIndex = (m_sharedTextures.size() == 1) ? 0 : i;
-		SharedTextureData& srcData = m_sharedTextures[sharedTextureIndex];
-		
-		vkCmdCopyImage(cmdBuffer,
-			srcData.sourceImage, srcData.currentLayout,
-			m_eyeSwapchains[i].images[swapchainReleaseQueue[i].second].image.image,
-			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			1, &copyRegions[i]);
-	}
+	VkImage dstImage = swapchainInfo.images[swapchainImageIndex].image.image;
 
-	// Batch all post-copy barriers
-	if (!postBarriers.empty()) {
-		vkCmdPipelineBarrier(cmdBuffer,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			0,
-			0, nullptr,
-			0, nullptr,
-			postBarriers.size(), postBarriers.data());
-	}
+	// Pre-copy barrier
+	VkImageMemoryBarrier preBarrier = {};
+	preBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	preBarrier.srcAccessMask = 0;
+	preBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	preBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	preBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	preBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	preBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	preBarrier.image = dstImage;
+	preBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	preBarrier.subresourceRange.baseMipLevel = 0;
+	preBarrier.subresourceRange.levelCount = 1;
+	preBarrier.subresourceRange.baseArrayLayer = 0;
+	preBarrier.subresourceRange.layerCount = 1;
+
+	vkCmdPipelineBarrier(cmdBuffer,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0,
+		0, nullptr,
+		0, nullptr,
+		1, &preBarrier);
+
+	// ONE copy of the FULL side-by-side texture (both eyes in one operation!)
+	VkImageCopy copyRegion = {};
+	copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copyRegion.srcSubresource.mipLevel = 0;
+	copyRegion.srcSubresource.baseArrayLayer = 0;
+	copyRegion.srcSubresource.layerCount = 1;
+	copyRegion.dstSubresource = copyRegion.srcSubresource;
+	copyRegion.srcOffset = {0, 0, 0};
+	copyRegion.extent = {srcData.width, srcData.height, 1};  // FULL width (both eyes!)
+	copyRegion.dstOffset = {0, 0, 0};
+
+	vkCmdCopyImage(cmdBuffer,
+		srcData.sourceImage, srcData.currentLayout,
+		dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1, &copyRegion);
+	
+	Logger::info(str::format("OpenXRDirectMode: Single copy - ", srcData.width, "x", srcData.height, " (both eyes at once!)"));
+
+	// Post-copy barrier
+	VkImageMemoryBarrier postBarrier = {};
+	postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	postBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	postBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+	postBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	postBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	postBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	postBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	postBarrier.image = dstImage;
+	postBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	postBarrier.subresourceRange.baseMipLevel = 0;
+	postBarrier.subresourceRange.levelCount = 1;
+	postBarrier.subresourceRange.baseArrayLayer = 0;
+	postBarrier.subresourceRange.layerCount = 1;
+
+	vkCmdPipelineBarrier(cmdBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		0,
+		0, nullptr,
+		0, nullptr,
+		1, &postBarrier);
 
 	if (useGPUTiming) {
 		vkCmdWriteTimestamp(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_queryPool, m_currentTimingIndex * 4);
 	}
 	
-	// Submit all copy operations at once
+	// Submit the single copy operation
 	endSingleTimeCommands(cmdBuffer);
 
-	// Release all swapchain images
-	for (const auto& release : swapchainReleaseQueue) {
-		XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-		XrResult result = xrReleaseSwapchainImage(release.first, &releaseInfo);
-		if (XR_FAILED(result)) {
-			Logger::err("OpenXRDirectMode: Failed to release swapchain image");
-		}
+	// Release the single swapchain image
+	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	result = xrReleaseSwapchainImage(swapchainInfo.handle, &releaseInfo);
+	if (XR_FAILED(result)) {
+		Logger::err("OpenXRDirectMode: Failed to release swapchain image");
 	}
 	
 	if (useGPUTiming) {
