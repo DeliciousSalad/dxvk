@@ -413,15 +413,23 @@ void OpenXRDirectMode::PrePresent(dxvk::D3D9DeviceEx *device)
 			Logger::info("OpenXRDirectMode: 🚫 PrePresent BLOCKING TF2 - waiting for VR frame permission");
 			
 			// BLOCK HERE: Wait for compositor to allow this frame to proceed
+			// Use wait_for with timeout to prevent indefinite blocking (e.g., during SteamVR overlay)
+			// Timeout of 50ms = ~20fps minimum, prevents complete stall while still syncing
 			std::unique_lock<std::mutex> lock(g_vrCompositor->m_tf2FrameSignalMutex);
-			g_vrCompositor->m_tf2FrameCondition.wait(lock, [&] {
+			bool signaled = g_vrCompositor->m_tf2FrameCondition.wait_for(lock, 
+				std::chrono::milliseconds(50), [&] {
 				return g_vrCompositor->m_tf2CanRenderFrame.load();
 			});
 			
-			// CONSUME PERMISSION: Set to false so only this frame can proceed
-			g_vrCompositor->m_tf2CanRenderFrame = false;
-			
-			Logger::info("OpenXRDirectMode: ✅ PrePresent UNBLOCKED - TF2 frame allowed to proceed");
+			if (signaled) {
+				// CONSUME PERMISSION: Set to false so only this frame can proceed
+				g_vrCompositor->m_tf2CanRenderFrame = false;
+				Logger::info("OpenXRDirectMode: ✅ PrePresent UNBLOCKED - TF2 frame allowed to proceed");
+			} else {
+				// Timeout - proceed anyway to prevent stuttering
+				// This can happen during SteamVR overlay or runtime hiccups
+				Logger::info("OpenXRDirectMode: ⚠️ PrePresent TIMEOUT - proceeding to prevent stall");
+			}
 		} else {
 			Logger::info("OpenXRDirectMode: PrePresent skipped - compositor is active");
 		}
@@ -1656,20 +1664,36 @@ static std::atomic<int> g_vguiFlushCount{0};
 // Async texture readiness signal
 static std::atomic<bool> g_textureReady{false};
 
+// Frame sequence tracking for ensuring complete frames
+// NOT static - these need external linkage for VRCompositor.cpp to access them
+std::atomic<uint64_t> g_tf2CompletedFrameId{0};  // Frame ID of last completed TF2 frame
+std::atomic<uint64_t> g_lastCopiedFrameId{0};     // Frame ID of last frame we copied
+
 // ASYNC TEXTURE COPY - Called from VR compositor thread only when signaled
 void CheckAndCopyTrackedVGUITexture() {
-    // Check if TF2 has signaled a new texture is ready
-    if (!g_textureReady.load()) {
-        return; // No new texture ready
+    // Get the current completed frame ID from TF2
+    uint64_t completedFrame = g_tf2CompletedFrameId.load(std::memory_order_acquire);
+    uint64_t lastCopied = g_lastCopiedFrameId.load(std::memory_order_relaxed);
+    
+    // Only copy if there's a new frame we haven't copied yet
+    if (completedFrame <= lastCopied) {
+        // No new frame to copy - this is normal, just use the existing texture
+        return;
     }
     
-    // Clear signal and proceed with copy
-    g_textureReady.store(false);
+    // Also check the legacy signal for compatibility
+    bool legacyReady = g_textureReady.load();
+    if (legacyReady) {
+        g_textureReady.store(false);
+    }
     
     static int checkCount = 0;
     checkCount++;
     
-    dxvk::Logger::info(str::format("VR Compositor: 🔄 ASYNC COPY #", checkCount, " - signaled by TF2"));
+    // Reduce logging - only log occasionally
+    if (checkCount % 60 == 1) {
+        dxvk::Logger::info(str::format("VR Compositor: 🔄 Copy frame ", completedFrame, " (copy #", checkCount, ")"));
+    }
     
     // NO LOCKS NEEDED - purely async approach
     
@@ -1833,37 +1857,25 @@ void CheckAndCopyTrackedVGUITexture() {
             g_lastSourceTexture = vkImage;
             g_sourceTextureStableCount++;
             
-            // Log which texture we're copying from (A or B) and why
-            const char* slotName = (textureToUse == &g_vguiTextureA) ? "A" : 
-                                   (textureToUse == &g_vguiTextureB) ? "B" : "FALLBACK";
-            const char* reason = (FORCE_SLOT_MODE == 1) ? "FORCE_A" : 
-                                 (FORCE_SLOT_MODE == 2) ? "FORCE_B" : 
-                                 (FORCE_SLOT_MODE == 4) ? "FLUSH_A" :
-                                 (FORCE_SLOT_MODE == 5) ? "PAINT_A" :
-                                 (FORCE_SLOT_MODE == 6) ? "PRESENT_A" :
-                                 (FORCE_SLOT_MODE == 7) ? "STABLE" :
-                                 (FORCE_SLOT_MODE == 0) ? "AUTO" : "FALLBACK";
+            // Copy the texture immediately
             
-            // Count render operations to detect if we're capturing mid-render
-            int renderOps = g_renderOpsSinceLastCopy.exchange(0);
-            
-            dxvk::Logger::info(str::format("VR Compositor: 🚀 IMMEDIATE COPY - VkImage: ", (void*)vkImage, " (call #", g_sourceTextureStableCount, ") from D3D9 texture: ", (void*)textureToUse->texture, " [slot ", slotName, " - ", reason, "] after ", renderOps, " render ops"));
-            
-            // CRITICAL: Check if this texture is likely to be a blank/empty texture
-            // TF2 might be alternating between actual VGUI content and blank textures
-            
-            // Copy immediately for maximum responsiveness
-            // The frame-complete signal should be sufficient synchronization
+            // Get the frame ID we're about to copy (the one TF2 just completed)
+            uint64_t frameToCopy = g_tf2CompletedFrameId.load(std::memory_order_acquire);
             
             // This should now be safe because TF2 has finished its frame + safety delay + texture is stable
             bool copySuccess = g_vrCompositor->CopyAndStoreMenuTexture(vkImage, desc->Width, desc->Height);
             
             if (copySuccess) {
-                dxvk::Logger::info("VR Compositor: ✅ Copy successful - texture ready for rendering");
-                // NOTE: No need to call SubmitFrame - the copy operation makes the texture available for rendering
-                // The compositor's render loop will automatically use the copied texture
+                // Update the last copied frame ID to prevent re-copying the same frame
+                g_lastCopiedFrameId.store(frameToCopy, std::memory_order_release);
+                
+                // Log occasionally
+                static int successCount = 0;
+                if (++successCount % 60 == 1) {
+                    dxvk::Logger::info(str::format("VR Compositor: ✅ Copied frame ", frameToCopy));
+                }
             } else {
-                dxvk::Logger::err("VR Compositor: ❌ Copy failed");
+                dxvk::Logger::warn("VR Compositor: ❌ Copy failed");
             }
         }
     } else {
@@ -1911,13 +1923,13 @@ extern "C" void __declspec(dllexport) TF2VR_NotifyVGUIPaintComplete() {
     g_vguiPaintCompleted.store(true);
     
     static int paintCompleteCount = 0;
-    if (++paintCompleteCount % 60 == 1) {  // Log occasionally
-        dxvk::Logger::info(str::format("TF2VR: 🎨 VGUI PAINT COMPLETE #", paintCompleteCount, " - UI painting finished, safe to copy Slot A"));
-    }
+    paintCompleteCount++;
     
-    // TF2VR: Also signal that texture is ready for copy (same as TF2VR_NotifyVGUIPresentComplete)
+    // Note: Don't increment frame ID here - let TF2VR_NotifyVGUIPresentComplete handle it
+    // Paint complete might be called before all GPU work is done
+    
+    // Set legacy signal for compatibility (but prefer present complete for frame tracking)
     g_textureReady.store(true);
-    dxvk::Logger::info("TF2VR: 🚀 TEXTURE READY - VGUI paint complete, signaling for copy");
 }
 
 // TF2VR: VGUI Present Completion Handler - Call this RIGHT AFTER vkQueuePresentKHR!
@@ -1935,14 +1947,18 @@ extern "C" void TF2VR_NotifyVGUIPresentComplete() {
     static int presentCompleteCount = 0;
     presentCompleteCount++;
     
-    // Log present completion
-    dxvk::Logger::info(str::format("TF2VR: 🖼️ PRESENT COMPLETE #", presentCompleteCount, " - All 5 passes done, final texture ready! (", deltaMs, "ms since last)"));
+    // Increment frame ID - this is the authoritative signal that a complete frame is ready
+    // Using fetch_add ensures atomic increment even if called from multiple threads
+    uint64_t newFrameId = g_tf2CompletedFrameId.fetch_add(1, std::memory_order_release) + 1;
     
-    // COMPLETELY ASYNC: Just signal texture is ready, copy happens on compositor thread
-    // No blocking operations in TF2's present path to prevent deadlocks
+    // Log present completion (reduced frequency)
+    if (presentCompleteCount % 60 == 1) {
+        dxvk::Logger::info(str::format("TF2VR: 🖼️ PRESENT COMPLETE #", presentCompleteCount, 
+            " frame=", newFrameId, " (", deltaMs, "ms since last)"));
+    }
+    
+    // Also set legacy signal for compatibility
     g_textureReady.store(true);
-    
-    dxvk::Logger::info("TF2VR: 🚀 ASYNC SIGNAL - texture ready for compositor copy");
 }
 
 // Global access to the present synchronization mutex (using timed_mutex for timeout support)

@@ -23,6 +23,10 @@ extern void CheckAndCopyTrackedVGUITexture();
 extern "C" void TF2VR_CompositorBeginTextureSync();
 extern std::timed_mutex* GetPresentSyncMutex();
 
+// Frame tracking variables from OpenXRDirectMode.cpp (global scope)
+extern std::atomic<uint64_t> g_tf2CompletedFrameId;
+extern std::atomic<uint64_t> g_lastCopiedFrameId;
+
 namespace dxvk {
     
 VRCompositor::~VRCompositor() { 
@@ -323,17 +327,18 @@ bool VRCompositor::RenderFrame(const XrFrameState& frameState, std::vector<XrCom
         return false;
     }
     
-    // Wait for fence to ensure previous frame is complete
-    VkResult result = vkWaitForFences(m_compositorDevice, 1, &m_compositorFence, VK_TRUE, UINT64_MAX);
-    if (result != VK_SUCCESS) {
-        Logger::warn(str::format("VRCompositor: Failed to wait for fence - error: ", static_cast<int>(result)));
-        return false;
-    }
-    
-    result = vkResetFences(m_compositorDevice, 1, &m_compositorFence);
+    // Reset the fence for this frame's GPU work tracking
+    // The fence should be signaled from the previous frame's wait
+    VkResult result = vkResetFences(m_compositorDevice, 1, &m_compositorFence);
     if (result != VK_SUCCESS) {
         Logger::warn(str::format("VRCompositor: Failed to reset fence - error: ", static_cast<int>(result)));
-        return false;
+        // Try waiting for the fence if it's still unsignaled
+        vkWaitForFences(m_compositorDevice, 1, &m_compositorFence, VK_TRUE, 10000000);
+        result = vkResetFences(m_compositorDevice, 1, &m_compositorFence);
+        if (result != VK_SUCCESS) {
+            Logger::err("VRCompositor: Failed to reset fence even after wait");
+            return false;
+        }
     }
     
     // Begin command buffer
@@ -378,13 +383,34 @@ bool VRCompositor::RenderFrame(const XrFrameState& frameState, std::vector<XrCom
         return false;
     }
     
+    // CRITICAL: Wait for GPU work to complete BEFORE releasing swapchain images
+    // Some OpenXR runtimes (non-SteamVR) may not handle async GPU work properly
+    // and expect the images to be fully rendered when released.
+    // This adds ~1-2ms latency but ensures consistent behavior across runtimes.
+    result = vkWaitForFences(m_compositorDevice, 1, &m_compositorFence, VK_TRUE, 10000000); // 10ms timeout
+    if (result == VK_TIMEOUT) {
+        Logger::warn("VRCompositor: GPU work timeout before swapchain release");
+    } else if (result != VK_SUCCESS) {
+        Logger::warn(str::format("VRCompositor: Fence wait failed: ", static_cast<int>(result)));
+    }
+    
+    // Release swapchain images AFTER GPU work is complete
+    for (int eye = 0; eye < 2; eye++) {
+        if (m_compositorSwapchains[eye] != XR_NULL_HANDLE) {
+            XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            XrResult xrResult = xrReleaseSwapchainImage(m_compositorSwapchains[eye], &releaseInfo);
+            if (XR_FAILED(xrResult)) {
+                Logger::warn(str::format("VRCompositor: Failed to release swapchain image for eye ", eye, " - error: ", static_cast<int>(xrResult)));
+            }
+        }
+    }
+    
     // Create OpenXR layer
     if (!CreateOpenXRLayer(frameState, layers)) {
         Logger::warn("VRCompositor: Failed to create OpenXR layer");
         return false;
     }
     
-    Logger::info("VRCompositor: ✅ Frame rendered successfully");
     return true;
 }
 
@@ -487,9 +513,8 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
     
     // CRITICAL: Add memory barriers and synchronization to ensure source texture is fully written
     // We need to make sure TF2 has finished writing to the source texture before we copy from it
-    
-    // Wait for any pending operations on the compositor queue to complete
-    vkQueueWaitIdle(m_compositorQueue);
+    // Note: We use pipeline barriers in the command buffer instead of vkQueueWaitIdle
+    // to avoid blocking the compositor thread unnecessarily.
     
     // Now perform the actual texture copy using a command buffer
     // Create command buffer for the copy operation
@@ -614,9 +639,16 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
         return false;
     }
     
-    // CRITICAL: Wait for the fence to guarantee copy completion before proceeding
-    result = vkWaitForFences(m_compositorDevice, 1, &copyFence, VK_TRUE, UINT64_MAX);
-    if (result != VK_SUCCESS) {
+    // Wait for the fence with a reasonable timeout (100ms) to avoid indefinite blocking
+    // If timeout occurs, we'll skip this copy and try again next frame
+    constexpr uint64_t COPY_TIMEOUT_NS = 100000000; // 100ms in nanoseconds
+    result = vkWaitForFences(m_compositorDevice, 1, &copyFence, VK_TRUE, COPY_TIMEOUT_NS);
+    if (result == VK_TIMEOUT) {
+        Logger::warn("VRCompositor: Texture copy fence timeout - will retry next frame");
+        vkDestroyFence(m_compositorDevice, copyFence, nullptr);
+        vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
+        return false;
+    } else if (result != VK_SUCCESS) {
         Logger::err(str::format("VRCompositor: Failed to wait for copy fence - error: ", result));
     }
     
@@ -1325,14 +1357,27 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
         return false;
     }
     
-    Logger::info(str::format("VRCompositor: Eye ", eye, " acquired swapchain image index ", imageIndex));
+    // Only log swapchain operations every 60 frames to reduce overhead
+    static int logCounter = 0;
+    bool shouldLog = (logCounter++ % 60 == 0);
     
-    // Wait for image to be available
+    if (shouldLog) {
+        Logger::info(str::format("VRCompositor: Eye ", eye, " acquired swapchain image index ", imageIndex));
+    }
+    
+    // Wait for image to be available with a reasonable timeout
+    // Using 50ms timeout - if we can't get an image in that time, something is wrong
     XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-    waitInfo.timeout = XR_INFINITE_DURATION;
+    waitInfo.timeout = 50000000; // 50ms in nanoseconds
     result = xrWaitSwapchainImage(m_compositorSwapchains[eye], &waitInfo);
-    if (XR_FAILED(result)) {
-        Logger::warn(str::format("VRCompositor: Failed to wait for swapchain image for eye ", eye));
+    if (result == XR_TIMEOUT_EXPIRED) {
+        Logger::warn(str::format("VRCompositor: Swapchain image wait TIMEOUT for eye ", eye, " - runtime may be overloaded"));
+        // Release the acquired image since we can't use it
+        XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+        xrReleaseSwapchainImage(m_compositorSwapchains[eye], &releaseInfo);
+        return false;
+    } else if (XR_FAILED(result)) {
+        Logger::warn(str::format("VRCompositor: Failed to wait for swapchain image for eye ", eye, " - error: ", static_cast<int>(result)));
         return false;
     }
     
@@ -1356,9 +1401,7 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
     }
     
     // If we have a 3D quad, render it using the proper pipeline
-    Logger::info(str::format("VRCompositor: Eye ", eye, " - m_has3DQuad: ", (m_has3DQuad ? "true" : "false")));
     if (m_has3DQuad) {
-        Logger::info(str::format("VRCompositor: Eye ", eye, " - RENDERING 3D QUAD"));
         // Render using proper Vulkan render pass - no manual layout transitions needed
         // The render pass handles layout transitions automatically
         Render3DQuad(eye, swapchainImage, frameState.predictedDisplayTime);
@@ -1417,18 +1460,11 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
         vkCmdPipelineBarrier(m_compositorCommandBuffer,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             0, 0, nullptr, 0, nullptr, 1, &barrier2);
-            
-        Logger::info(str::format("VRCompositor: Eye ", eye, " - cleared to ", (eye == 0 ? "cyan" : "magenta"), " color"));
     }
     
-    // Release the swapchain image
-    Logger::info(str::format("VRCompositor: Eye ", eye, " released swapchain image index ", imageIndex));
-    XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-    result = xrReleaseSwapchainImage(m_compositorSwapchains[eye], &releaseInfo);
-    if (XR_FAILED(result)) {
-        Logger::warn(str::format("VRCompositor: Failed to release swapchain image for eye ", eye));
-        return false;
-    }
+    // NOTE: Do NOT release swapchain image here!
+    // The release must happen AFTER vkQueueSubmit so the GPU work is actually submitted.
+    // See RenderFrame() for where release happens.
     
     return true;
 }
@@ -1558,8 +1594,8 @@ void VRCompositor::CompositorThreadFunc() {
     Logger::info("VRCompositor: 🧵 Compositor thread started");
     
     while (!m_shouldStop.load()) {
-        // Check for and copy VGUI textures (safe polling)
-        ::CheckAndCopyTrackedVGUITexture();
+        // NOTE: Texture copying now happens inside RunIndependentFrame after xrBeginFrame
+        // This ensures we copy the latest texture right before rendering
         
         // Check for updated HUD position data from game and update vertex buffer if needed
         CheckAndUpdateHUDPosition();
@@ -1943,6 +1979,15 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
+    // NOTE: GPU fence wait now happens in RenderFrame() after vkQueueSubmit
+    // This ensures GPU work is complete before swapchain release, which is the
+    // correct synchronization point for OpenXR.
+    
+    // Track frame-to-frame timing (for debugging pacing issues)
+    static auto lastFrameTime = std::chrono::high_resolution_clock::now();
+    auto frameStartTime = std::chrono::high_resolution_clock::now();
+    lastFrameTime = frameStartTime;
+    
     // Wait for the next frame
     XrFrameWaitInfo frameWaitInfo = { XR_TYPE_FRAME_WAIT_INFO };
     XrFrameState frameState = { XR_TYPE_FRAME_STATE };
@@ -1952,6 +1997,8 @@ bool VRCompositor::RunIndependentFrame() {
         Logger::warn(str::format("VRCompositor: Independent xrWaitFrame failed - error: ", static_cast<int>(result)));
         return false;
     }
+    
+    auto afterWaitFrame = std::chrono::high_resolution_clock::now();
     
     // CRITICAL: Store frame state for input synchronization
     // This ensures controller poses use the correct predicted display time
@@ -1970,12 +2017,46 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
-    // PRESENT-DRIVEN: Don't pull textures here - let TF2's present completion push them
-    // This avoids capturing textures mid-construction
+    auto afterBeginFrame = std::chrono::high_resolution_clock::now();
+    
+    // Track if TF2 has a new frame ready before copying
+    // g_tf2CompletedFrameId and g_lastCopiedFrameId are defined in OpenXRDirectMode.cpp
+    uint64_t tf2Frame = ::g_tf2CompletedFrameId.load(std::memory_order_acquire);
+    uint64_t lastCopied = ::g_lastCopiedFrameId.load(std::memory_order_relaxed);
+    bool hasNewFrame = (tf2Frame > lastCopied);
+    
+    // Track frame consistency (only log significant gaps)
+    static int framesWithoutNew = 0;
+    if (hasNewFrame) {
+        framesWithoutNew = 0;
+    } else {
+        framesWithoutNew++;
+        // Only log if gap is significant (TF2 noticeably behind VR refresh)
+        if (framesWithoutNew == 5) {
+            Logger::info(str::format("VRCompositor: TF2 frame gap detected (tf2=", tf2Frame, ")"));
+        }
+    }
+    
+    // Copy texture from TF2 BEFORE unblocking - use what TF2 produced in its last frame
+    // IMPORTANT: Must copy BEFORE unblocking to prevent TF2 from modifying the texture
+    extern void CheckAndCopyTrackedVGUITexture();
+    ::CheckAndCopyTrackedVGUITexture();
+    
+    auto afterTextureCopy = std::chrono::high_resolution_clock::now();
+    
+    // NOW unblock TF2 - texture has been safely copied
+    // TF2 can prepare its next frame while we render with the copied texture
+    {
+        std::lock_guard<std::mutex> lock(m_tf2FrameSignalMutex);
+        m_tf2CanRenderFrame = true;
+    }
+    m_tf2FrameCondition.notify_all();
     
     // Use RenderFrame instead of calling RenderEye directly
     std::vector<XrCompositionLayerBaseHeader*> layers;
     bool rendered = RenderFrame(frameState, layers);
+    
+    auto afterRender = std::chrono::high_resolution_clock::now();
     
     // End the frame
     XrFrameEndInfo frameEndInfo = { XR_TYPE_FRAME_END_INFO };
@@ -1990,22 +2071,25 @@ bool VRCompositor::RunIndependentFrame() {
         return false;
     }
     
-    // AFTER xrEndFrame: Always copy texture and unblock exactly one TF2 frame
-    Logger::info("VRCompositor: 🖼️ VR frame complete - copying TF2 texture and unblocking");
+    auto afterEndFrame = std::chrono::high_resolution_clock::now();
     
-    // Copy the texture from TF2 if available
-    extern void CheckAndCopyTrackedVGUITexture();
-    ::CheckAndCopyTrackedVGUITexture();
+    // Calculate timing deltas in milliseconds
+    auto waitToBegin = std::chrono::duration<double, std::milli>(afterBeginFrame - afterWaitFrame).count();
+    auto beginToTexCopy = std::chrono::duration<double, std::milli>(afterTextureCopy - afterBeginFrame).count();
+    auto texCopyToRender = std::chrono::duration<double, std::milli>(afterRender - afterTextureCopy).count();
+    auto renderToEnd = std::chrono::duration<double, std::milli>(afterEndFrame - afterRender).count();
+    auto totalFrameTime = std::chrono::duration<double, std::milli>(afterEndFrame - afterWaitFrame).count();
     
-    // UNBLOCK TF2: VR frame is complete, allow exactly one TF2 frame
-    {
-        std::lock_guard<std::mutex> lock(m_tf2FrameSignalMutex);
-        m_tf2CanRenderFrame = true;
-        Logger::info("VRCompositor: 🔓 UNBLOCKING TF2 - VR frame complete, TF2 can render next frame");
+    // Log timing every 60 frames or if frame took too long (>12ms = missed 90Hz)
+    static int timingLogCounter = 0;
+    timingLogCounter++;
+    if (timingLogCounter % 60 == 0 || totalFrameTime > 12.0) {
+        Logger::info(str::format("VRCompositor: ⏱️ Frame timing (ms): BeginFrame=", 
+            waitToBegin, ", TexCopy=", beginToTexCopy, 
+            ", Render=", texCopyToRender, ", EndFrame=", renderToEnd, 
+            ", TOTAL=", totalFrameTime, (totalFrameTime > 12.0 ? " ⚠️SLOW" : "")));
     }
-    m_tf2FrameCondition.notify_all();
     
-    Logger::info("VRCompositor: ✅ Frame rendered successfully");
     return true;
 }
 
