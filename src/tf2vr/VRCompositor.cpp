@@ -1,4 +1,5 @@
 #include "VRCompositor.h"
+#include "OpenXRDirectMode.h"
 #include "hmdWrapper.h"
 #include "hud_position_shared.h"
 #include "../util/util_string.h"
@@ -6,15 +7,14 @@
 
 #include <tf2vr_vr_quad_frag.h>
 #include <tf2vr_vr_quad_vert.h>
+#include <tf2vr_controller_model_frag.h>
+#include <tf2vr_controller_model_vert.h>
 #include <chrono>
 #include <fstream>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-
-// Forward declare what we need from OpenXRDirectMode
-class OpenXRDirectMode;
 
 // Forward declare VGUI texture checking function
 extern void CheckAndCopyTrackedVGUITexture();
@@ -186,6 +186,9 @@ void VRCompositor::CleanupVulkanResources() {
         m_compositorCommandBuffer = VK_NULL_HANDLE; // Destroyed with pool
     }
     
+    // Cleanup controller model resources
+    CleanupControllerResources();
+    
     // Finally destroy the device
     if (m_compositorDevice != VK_NULL_HANDLE) {
         vkDestroyDevice(m_compositorDevice, nullptr);
@@ -196,7 +199,7 @@ void VRCompositor::CleanupVulkanResources() {
     Logger::info("VRCompositor: ✅ Vulkan resources cleaned up");
 }
 
-void VRCompositor::SetOpenXRManager(OpenXRDirectMode* manager) {
+void VRCompositor::SetOpenXRManager(::OpenXRDirectMode* manager) {
     m_pOpenXRManager = manager;
 }
 
@@ -259,6 +262,15 @@ bool VRCompositor::Initialize() {
     Logger::info("VRCompositor: ✅ Vulkan rendering pipeline created");
     
     Logger::info(str::format("VRCompositor: Swapchains created flag: ", m_compositorSwapchainsCreated));
+    
+    // Initialize controller model rendering (optional - will log if not available)
+    Logger::info("VRCompositor: Initializing controller models...");
+    if (InitializeControllerModels()) {
+        Logger::info("VRCompositor: ✅ Controller models initialized");
+    } else {
+        Logger::warn("VRCompositor: Controller models not available (this is OK)");
+    }
+    
     Logger::info("VRCompositor: ✅ VR Compositor initialized successfully - ready for activation");
     return true;
 }
@@ -1168,7 +1180,7 @@ bool VRCompositor::CalculateMVPMatrixForEye(int eye, XrTime displayTime, float* 
         float viewMatrix[16];
         CreateProperViewMatrix(views[eye].pose, viewMatrix);
         
-        // Calculate MVP = View * Projection (no model matrix - quad positioned by vertices)
+        // Calculate MVP = View * Projection (quad positioned by vertices in world space)
         MultiplyMatrix4x4(viewMatrix, projMatrix, mvpMatrix);
         
         // MVP calculation successful
@@ -1404,7 +1416,19 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
     if (m_has3DQuad) {
         // Render using proper Vulkan render pass - no manual layout transitions needed
         // The render pass handles layout transitions automatically
+        // Try to load controller models if not yet loaded (they become available after xrSyncActions)
+        if (!m_controllerModelsLoaded && m_controllerModelsInitialized && m_controllerModelManager) {
+            if (m_cachedSession != XR_NULL_HANDLE) {
+                m_controllerModelsLoaded = m_controllerModelManager->LoadControllerModels(m_cachedSession);
+                if (m_controllerModelsLoaded) {
+                    Logger::info("VRCompositor: Controller models now loaded!");
+                }
+            }
+        }
+        
+        // Render quad (and controller models inside the same render pass)
         Render3DQuad(eye, swapchainImage, frameState.predictedDisplayTime);
+        
         Logger::info(str::format("VRCompositor: Eye ", eye, " - rendered 3D quad"));
     } else {
         Logger::info(str::format("VRCompositor: Eye ", eye, " - FALLBACK to clear color"));
@@ -2292,6 +2316,35 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
     // Draw the quad (6 vertices = 2 triangles)
     vkCmdDraw(m_compositorCommandBuffer, 6, 1, 0, 0);
     
+    // Render controller models inside the same render pass (before ending it)
+    // This ensures the controllers are rendered on top of the quad
+    if (m_controllerModelsLoaded && m_controllerModelManager) {
+        // Ensure pipeline is created (will only create once)
+        if (!m_controllerPipelineCreated) {
+            EnsureControllerPipelineCreated();
+        }
+    }
+    if (m_controllerModelsLoaded && m_controllerModelManager && m_controllerPipelineCreated) {
+        // Update controller animation state (positions, visibility) for this frame
+        m_controllerModelManager->UpdateAnimationState(displayTime);
+        
+        // Calculate view-projection matrix for this eye
+        float viewProjMatrix[16];
+        if (CalculateMVPMatrixForEye(eye, displayTime, viewProjMatrix)) {
+            // Render left controller
+            const ControllerModel* leftModel = m_controllerModelManager->GetLeftController();
+            if (leftModel && leftModel->isLoaded) {
+                RenderSingleControllerModel(m_compositorCommandBuffer, leftModel, viewProjMatrix, displayTime);
+            }
+            
+            // Render right controller  
+            const ControllerModel* rightModel = m_controllerModelManager->GetRightController();
+            if (rightModel && rightModel->isLoaded) {
+                RenderSingleControllerModel(m_compositorCommandBuffer, rightModel, viewProjMatrix, displayTime);
+            }
+        }
+    }
+    
     // End render pass
     vkCmdEndRenderPass(m_compositorCommandBuffer);
     
@@ -3166,6 +3219,665 @@ bool VRCompositor::CreateMaskTextureFromPNG(const unsigned char* pngData, int wi
     
     Logger::info("VRCompositor: ✅ Mask texture created successfully");
     return true;
+}
+
+// =============================================================================
+// Controller Model Rendering Implementation
+// =============================================================================
+
+bool VRCompositor::InitializeControllerModels() {
+    if (m_controllerModelsInitialized) {
+        return m_controllerModelsLoaded;
+    }
+    
+    if (m_compositorDevice == VK_NULL_HANDLE) {
+        Logger::warn("VRCompositor: Cannot init controller models - no compositor device");
+        return false;
+    }
+    if (!m_pOpenXRManager) {
+        Logger::warn("VRCompositor: Cannot init controller models - no OpenXR manager");
+        return false;
+    }
+    
+    Logger::info("VRCompositor: Initializing controller model rendering...");
+    Logger::info(str::format("VRCompositor: OpenXR manager HasRenderModelSupport: ", m_pOpenXRManager->HasRenderModelSupport()));
+    
+    // Create the controller model manager
+    m_controllerModelManager = std::make_unique<VRControllerModelManager>();
+    if (!m_controllerModelManager->Initialize(m_pOpenXRManager, m_compositorDevice, m_cachedPhysicalDevice)) {
+        Logger::err("VRCompositor: Failed to initialize controller model manager");
+        return false;
+    }
+    
+    m_controllerModelsInitialized = true;
+    
+    // Try to load controller models (may fail if xrSyncActions hasn't been called yet)
+    if (m_cachedSession != XR_NULL_HANDLE) {
+        m_controllerModelsLoaded = m_controllerModelManager->LoadControllerModels(m_cachedSession);
+        if (m_controllerModelsLoaded) {
+            Logger::info("VRCompositor: Controller models loaded successfully");
+        }
+    }
+    
+    return m_controllerModelsLoaded;
+}
+
+bool VRCompositor::CreateDepthResources() {
+    if (m_compositorDevice == VK_NULL_HANDLE) return false;
+    
+    Logger::info("VRCompositor: Creating depth buffer resources...");
+    
+    // Find a suitable depth format
+    VkFormat depthFormats[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D24_UNORM_S8_UINT
+    };
+    
+    m_depthFormat = VK_FORMAT_UNDEFINED;
+    for (VkFormat format : depthFormats) {
+        VkFormatProperties props;
+        vkGetPhysicalDeviceFormatProperties(m_cachedPhysicalDevice, format, &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            m_depthFormat = format;
+            break;
+        }
+    }
+    
+    if (m_depthFormat == VK_FORMAT_UNDEFINED) {
+        Logger::err("VRCompositor: Failed to find suitable depth format");
+        return false;
+    }
+    
+    Logger::info(str::format("VRCompositor: Using depth format ", (int)m_depthFormat));
+    
+    // Create depth images for each eye
+    for (int eye = 0; eye < 2; eye++) {
+        VkImageCreateInfo imageInfo = {};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = m_depthFormat;
+        imageInfo.extent.width = m_cachedRenderWidth;
+        imageInfo.extent.height = m_cachedRenderHeight;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        
+        if (vkCreateImage(m_compositorDevice, &imageInfo, nullptr, &m_depthImages[eye]) != VK_SUCCESS) {
+            Logger::err("VRCompositor: Failed to create depth image");
+            return false;
+        }
+        
+        // Allocate memory
+        VkMemoryRequirements memReqs;
+        vkGetImageMemoryRequirements(m_compositorDevice, m_depthImages[eye], &memReqs);
+        
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        
+        if (vkAllocateMemory(m_compositorDevice, &allocInfo, nullptr, &m_depthMemory[eye]) != VK_SUCCESS) {
+            Logger::err("VRCompositor: Failed to allocate depth image memory");
+            return false;
+        }
+        
+        vkBindImageMemory(m_compositorDevice, m_depthImages[eye], m_depthMemory[eye], 0);
+        
+        // Create image view
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = m_depthImages[eye];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = m_depthFormat;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        
+        if (vkCreateImageView(m_compositorDevice, &viewInfo, nullptr, &m_depthImageViews[eye]) != VK_SUCCESS) {
+            Logger::err("VRCompositor: Failed to create depth image view");
+            return false;
+        }
+    }
+    
+    Logger::info("VRCompositor: Depth buffer resources created successfully");
+    return true;
+}
+
+bool VRCompositor::CreateControllerRenderPass() {
+    if (m_compositorDevice == VK_NULL_HANDLE) return false;
+    
+    // Color attachment
+    VkAttachmentDescription colorAttachment = {};
+    colorAttachment.format = VK_FORMAT_R8G8B8A8_SRGB;  // Match swapchain format
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // Load existing content (menu quad)
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    
+    // Depth attachment
+    VkAttachmentDescription depthAttachment = {};
+    depthAttachment.format = m_depthFormat;
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    
+    VkAttachmentReference colorRef = {};
+    colorRef.attachment = 0;
+    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    
+    VkAttachmentReference depthRef = {};
+    depthRef.attachment = 1;
+    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
+    
+    VkSubpassDependency dependency = {};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.srcAccessMask = 0;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    
+    VkAttachmentDescription attachments[] = {colorAttachment, depthAttachment};
+    
+    VkRenderPassCreateInfo renderPassInfo = {};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 2;
+    renderPassInfo.pAttachments = attachments;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+    
+    if (vkCreateRenderPass(m_compositorDevice, &renderPassInfo, nullptr, &m_controllerRenderPass) != VK_SUCCESS) {
+        Logger::err("VRCompositor: Failed to create controller render pass");
+        return false;
+    }
+    
+    Logger::info("VRCompositor: Controller render pass created");
+    return true;
+}
+
+bool VRCompositor::CreateControllerShaderModules() {
+    if (m_compositorDevice == VK_NULL_HANDLE) return false;
+    
+    Logger::info("VRCompositor: Creating controller shader modules...");
+    
+    // Create vertex shader module
+    VkShaderModuleCreateInfo vertShaderInfo = {};
+    vertShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vertShaderInfo.codeSize = sizeof(tf2vr_controller_model_vert);
+    vertShaderInfo.pCode = tf2vr_controller_model_vert;
+    
+    if (vkCreateShaderModule(m_compositorDevice, &vertShaderInfo, nullptr, &m_controllerVertShader) != VK_SUCCESS) {
+        Logger::err("VRCompositor: Failed to create controller vertex shader module");
+        return false;
+    }
+    
+    // Create fragment shader module
+    VkShaderModuleCreateInfo fragShaderInfo = {};
+    fragShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fragShaderInfo.codeSize = sizeof(tf2vr_controller_model_frag);
+    fragShaderInfo.pCode = tf2vr_controller_model_frag;
+    
+    if (vkCreateShaderModule(m_compositorDevice, &fragShaderInfo, nullptr, &m_controllerFragShader) != VK_SUCCESS) {
+        Logger::err("VRCompositor: Failed to create controller fragment shader module");
+        return false;
+    }
+    
+    Logger::info("VRCompositor: Controller shader modules created successfully");
+    return true;
+}
+
+bool VRCompositor::CreateControllerPipelineLayout() {
+    if (m_compositorDevice == VK_NULL_HANDLE) return false;
+    
+    // Push constant range for MVP, model matrix, and base color
+    VkPushConstantRange pushConstant = {};
+    pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushConstant.offset = 0;
+    pushConstant.size = sizeof(ControllerModelPushConstants);
+    
+    VkPipelineLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 0;  // No descriptor sets for now (using push constants)
+    layoutInfo.pSetLayouts = nullptr;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushConstant;
+    
+    if (vkCreatePipelineLayout(m_compositorDevice, &layoutInfo, nullptr, &m_controllerPipelineLayout) != VK_SUCCESS) {
+        Logger::err("VRCompositor: Failed to create controller pipeline layout");
+        return false;
+    }
+    
+    Logger::info("VRCompositor: Controller pipeline layout created");
+    return true;
+}
+
+bool VRCompositor::CreateControllerGraphicsPipeline() {
+    if (m_compositorDevice == VK_NULL_HANDLE || m_controllerRenderPass == VK_NULL_HANDLE) return false;
+    if (m_controllerVertShader == VK_NULL_HANDLE || m_controllerFragShader == VK_NULL_HANDLE) return false;
+    
+    Logger::info("VRCompositor: Creating controller graphics pipeline...");
+    
+    // Shader stages
+    VkPipelineShaderStageCreateInfo vertStageInfo = {};
+    vertStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStageInfo.module = m_controllerVertShader;
+    vertStageInfo.pName = "main";
+    
+    VkPipelineShaderStageCreateInfo fragStageInfo = {};
+    fragStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragStageInfo.module = m_controllerFragShader;
+    fragStageInfo.pName = "main";
+    
+    VkPipelineShaderStageCreateInfo shaderStages[] = {vertStageInfo, fragStageInfo};
+    
+    // Vertex input (Vertex3D format)
+    auto bindingDesc = Vertex3D::GetBindingDescription();
+    auto attrDescs = Vertex3D::GetAttributeDescriptions();
+    
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
+    vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDesc;
+    vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrDescs.size());
+    vertexInputInfo.pVertexAttributeDescriptions = attrDescs.data();
+    
+    // Input assembly
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+    
+    // Viewport and scissor (dynamic)
+    VkPipelineViewportStateCreateInfo viewportState = {};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    
+    // Rasterizer
+    VkPipelineRasterizationStateCreateInfo rasterizer = {};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.depthClampEnable = VK_FALSE;
+    rasterizer.rasterizerDiscardEnable = VK_FALSE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;  // Disable culling for debugging
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
+    
+    // Multisampling
+    VkPipelineMultisampleStateCreateInfo multisampling = {};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.sampleShadingEnable = VK_FALSE;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    
+    // Depth testing (disabled - quad render pass has no depth attachment)
+    VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_FALSE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthBoundsTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_FALSE;
+    
+    // Color blending
+    VkPipelineColorBlendAttachmentState colorBlendAttachment = {};
+    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | 
+                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;  // Disable blending for debugging - fully opaque
+    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    
+    VkPipelineColorBlendStateCreateInfo colorBlending = {};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.logicOpEnable = VK_FALSE;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+    
+    // Dynamic state
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState = {};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+    
+    // Create pipeline
+    VkGraphicsPipelineCreateInfo pipelineInfo = {};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = m_controllerPipelineLayout;
+    // Use the same render pass as the quad so we can render controllers in the same pass
+    pipelineInfo.renderPass = m_renderPass;
+    pipelineInfo.subpass = 0;
+    
+    if (vkCreateGraphicsPipelines(m_compositorDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_controllerPipeline) != VK_SUCCESS) {
+        Logger::err("VRCompositor: Failed to create controller graphics pipeline");
+        return false;
+    }
+    
+    Logger::info("VRCompositor: Controller graphics pipeline created successfully");
+    return true;
+}
+
+bool VRCompositor::CreateControllerFramebuffers() {
+    if (m_compositorDevice == VK_NULL_HANDLE || m_controllerRenderPass == VK_NULL_HANDLE) return false;
+    
+    // Framebuffers will be created per-frame with the actual swapchain image
+    // This is just a placeholder to indicate the infrastructure is ready
+    Logger::info("VRCompositor: Controller framebuffers will be created per-frame");
+    return true;
+}
+
+bool VRCompositor::EnsureControllerPipelineCreated() {
+    if (m_controllerPipelineCreated) return true;
+    
+    if (!CreateDepthResources()) return false;
+    if (!CreateControllerRenderPass()) return false;
+    if (!CreateControllerPipelineLayout()) return false;
+    if (!CreateControllerShaderModules()) return false;
+    if (!CreateControllerGraphicsPipeline()) return false;
+    if (!CreateControllerFramebuffers()) return false;
+    
+    m_controllerPipelineCreated = true;
+    Logger::info("VRCompositor: Controller rendering pipeline ready");
+    return true;
+}
+
+void VRCompositor::CleanupControllerResources() {
+    if (m_compositorDevice == VK_NULL_HANDLE) return;
+    
+    Logger::info("VRCompositor: Cleaning up controller model resources...");
+    
+    // Cleanup controller model manager
+    if (m_controllerModelManager) {
+        m_controllerModelManager->Shutdown();
+        m_controllerModelManager.reset();
+    }
+    
+    // Cleanup framebuffers
+    for (int eye = 0; eye < 2; eye++) {
+        if (m_controllerFramebuffers[eye] != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(m_compositorDevice, m_controllerFramebuffers[eye], nullptr);
+            m_controllerFramebuffers[eye] = VK_NULL_HANDLE;
+        }
+    }
+    
+    // Cleanup depth resources
+    for (int eye = 0; eye < 2; eye++) {
+        if (m_depthImageViews[eye] != VK_NULL_HANDLE) {
+            vkDestroyImageView(m_compositorDevice, m_depthImageViews[eye], nullptr);
+            m_depthImageViews[eye] = VK_NULL_HANDLE;
+        }
+        if (m_depthImages[eye] != VK_NULL_HANDLE) {
+            vkDestroyImage(m_compositorDevice, m_depthImages[eye], nullptr);
+            m_depthImages[eye] = VK_NULL_HANDLE;
+        }
+        if (m_depthMemory[eye] != VK_NULL_HANDLE) {
+            vkFreeMemory(m_compositorDevice, m_depthMemory[eye], nullptr);
+            m_depthMemory[eye] = VK_NULL_HANDLE;
+        }
+    }
+    
+    // Cleanup shaders
+    if (m_controllerVertShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(m_compositorDevice, m_controllerVertShader, nullptr);
+        m_controllerVertShader = VK_NULL_HANDLE;
+    }
+    if (m_controllerFragShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(m_compositorDevice, m_controllerFragShader, nullptr);
+        m_controllerFragShader = VK_NULL_HANDLE;
+    }
+    
+    // Cleanup pipeline
+    if (m_controllerPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_compositorDevice, m_controllerPipeline, nullptr);
+        m_controllerPipeline = VK_NULL_HANDLE;
+    }
+    if (m_controllerPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_compositorDevice, m_controllerPipelineLayout, nullptr);
+        m_controllerPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_controllerDescriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_compositorDevice, m_controllerDescriptorSetLayout, nullptr);
+        m_controllerDescriptorSetLayout = VK_NULL_HANDLE;
+    }
+    if (m_controllerRenderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(m_compositorDevice, m_controllerRenderPass, nullptr);
+        m_controllerRenderPass = VK_NULL_HANDLE;
+    }
+    
+    m_controllerPipelineCreated = false;
+    m_controllerModelsLoaded = false;
+    m_controllerModelsInitialized = false;
+    
+    Logger::info("VRCompositor: Controller resources cleaned up");
+}
+
+void VRCompositor::RenderControllerModels(int eye, VkCommandBuffer cmdBuffer, XrTime displayTime) {
+    if (!m_controllerModelsLoaded || !m_controllerModelManager) return;
+    
+    // Ensure the controller rendering pipeline is created
+    if (!m_controllerPipelineCreated) {
+        if (!EnsureControllerPipelineCreated()) {
+            Logger::warn("VRCompositor: Failed to create controller pipeline");
+            return;
+        }
+        Logger::info("VRCompositor: Controller rendering pipeline created");
+    }
+    
+    if (m_controllerPipeline == VK_NULL_HANDLE) return;
+    
+    // Update animation state for this frame
+    m_controllerModelManager->UpdateAnimationState(displayTime);
+    
+    // Calculate view-projection matrix for this eye
+    float viewProjMatrix[16];
+    if (!CalculateMVPMatrixForEye(eye, displayTime, viewProjMatrix)) {
+        return;
+    }
+    
+    // Render left controller
+    const ControllerModel* leftModel = m_controllerModelManager->GetLeftController();
+    if (leftModel && leftModel->isLoaded) {
+        static bool loggedLeft = false;
+        if (!loggedLeft) {
+            Logger::info(str::format("VRCompositor: Rendering left controller (visible=", leftModel->isVisible, 
+                " meshes=", leftModel->meshes.size(), ")"));
+            loggedLeft = true;
+        }
+        RenderSingleControllerModel(cmdBuffer, leftModel, viewProjMatrix, displayTime);
+    }
+    
+    // Render right controller
+    const ControllerModel* rightModel = m_controllerModelManager->GetRightController();
+    if (rightModel && rightModel->isLoaded) {
+        static bool loggedRight = false;
+        if (!loggedRight) {
+            Logger::info(str::format("VRCompositor: Rendering right controller (visible=", rightModel->isVisible,
+                " meshes=", rightModel->meshes.size(), ")"));
+            loggedRight = true;
+        }
+        RenderSingleControllerModel(cmdBuffer, rightModel, viewProjMatrix, displayTime);
+    }
+}
+
+void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const ControllerModel* model,
+                                                const float* viewProjMatrix, XrTime displayTime) {
+    if (!model || !model->isLoaded) return;
+    
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Logger::info(str::format("VRCompositor: RenderSingleControllerModel - nodes=", model->nodes.size(), 
+            " meshes=", model->meshes.size()));
+        Logger::info(str::format("VRCompositor: Controller pose position: x=", model->currentPose.position.x,
+            " y=", model->currentPose.position.y, " z=", model->currentPose.position.z));
+        Logger::info(str::format("VRCompositor: Controller pose orientation: x=", model->currentPose.orientation.x,
+            " y=", model->currentPose.orientation.y, " z=", model->currentPose.orientation.z, 
+            " w=", model->currentPose.orientation.w));
+        loggedOnce = true;
+    }
+    
+    // Bind the controller pipeline
+    vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_controllerPipeline);
+    
+    // Set viewport and scissor (dynamic state - must be set after binding pipeline)
+    VkViewport viewport = {};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(m_cachedRenderWidth);
+    viewport.height = static_cast<float>(m_cachedRenderHeight);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmdBuffer, 0, 1, &viewport);
+    
+    VkRect2D scissor = {};
+    scissor.offset = {0, 0};
+    scissor.extent = {m_cachedRenderWidth, m_cachedRenderHeight};
+    vkCmdSetScissor(cmdBuffer, 0, 1, &scissor);
+    
+    // For each node with a mesh
+    static int drawCallCount = 0;
+    int thisFrameDraws = 0;
+    for (size_t nodeIdx = 0; nodeIdx < model->nodes.size(); nodeIdx++) {
+        const ControllerNode& node = model->nodes[nodeIdx];
+        if (node.meshIndex < 0) continue;
+        // Skip visibility check for now - just render all meshes
+        // if (!node.isVisible) continue;
+        
+        const ControllerMesh& mesh = model->meshes[node.meshIndex];
+        if (mesh.vertexBuffer == VK_NULL_HANDLE || mesh.indexCount == 0) continue;
+        thisFrameDraws++;
+        
+        // Compute MVP for this node
+        ControllerModelPushConstants pc = {};
+        
+        // Model matrix = controller pose * node world matrix
+        float modelMatrix[16];
+        // Convert XrPosef to matrix
+        float poseMatrix[16];
+        // The view matrix inverts Y to match Vulkan's coordinate system
+        float qx = model->currentPose.orientation.x;
+        float qy = model->currentPose.orientation.y;
+        float qz = model->currentPose.orientation.z;
+        float qw = model->currentPose.orientation.w;
+        
+        // Build pose matrix
+        QuaternionToMatrix(qx, qy, qz, qw, poseMatrix);
+        poseMatrix[12] = model->currentPose.position.x;
+        poseMatrix[13] = -model->currentPose.position.y;  // Invert Y to match view matrix
+        poseMatrix[14] = model->currentPose.position.z;
+        
+        // Invert Y column to fix pitch
+        poseMatrix[1] = -poseMatrix[1];
+        poseMatrix[5] = -poseMatrix[5];
+        poseMatrix[9] = -poseMatrix[9];
+        
+        MultiplyMatrices(poseMatrix, node.worldMatrix, modelMatrix);
+        memcpy(pc.modelMatrix, modelMatrix, sizeof(float) * 16);
+        
+        // Pass viewProj directly - shader will apply model transform itself
+        // This matches how the quad works: viewProj transforms world-space vertices to clip space
+        memcpy(pc.mvpMatrix, viewProjMatrix, sizeof(float) * 16);
+        
+        // Debug: log matrices and mesh info once
+        static bool loggedMVP = false;
+        if (!loggedMVP) {
+            Logger::info(str::format("VRCompositor: Node worldMatrix[0-3]=", node.worldMatrix[0], " ", node.worldMatrix[1], " ", node.worldMatrix[2], " ", node.worldMatrix[3]));
+            Logger::info(str::format("VRCompositor: Node worldMatrix[12-15]=", node.worldMatrix[12], " ", node.worldMatrix[13], " ", node.worldMatrix[14], " ", node.worldMatrix[15]));
+            Logger::info(str::format("VRCompositor: ModelMatrix[0-3]=", modelMatrix[0], " ", modelMatrix[1], " ", modelMatrix[2], " ", modelMatrix[3]));
+            Logger::info(str::format("VRCompositor: ModelMatrix[12-15]=", modelMatrix[12], " ", modelMatrix[13], " ", modelMatrix[14], " ", modelMatrix[15]));
+            Logger::info(str::format("VRCompositor: ViewProj[0-3]=", viewProjMatrix[0], " ", viewProjMatrix[1], " ", viewProjMatrix[2], " ", viewProjMatrix[3]));
+            Logger::info(str::format("VRCompositor: ViewProj[12-15]=", viewProjMatrix[12], " ", viewProjMatrix[13], " ", viewProjMatrix[14], " ", viewProjMatrix[15]));
+            Logger::info(str::format("VRCompositor: MVP[0-3]=", pc.mvpMatrix[0], " ", pc.mvpMatrix[1], " ", pc.mvpMatrix[2], " ", pc.mvpMatrix[3]));
+            Logger::info(str::format("VRCompositor: MVP[12-15]=", pc.mvpMatrix[12], " ", pc.mvpMatrix[13], " ", pc.mvpMatrix[14], " ", pc.mvpMatrix[15]));
+            Logger::info(str::format("VRCompositor: Mesh vertices=", mesh.vertices.size(), " indexCount=", mesh.indexCount));
+            loggedMVP = true;
+        }
+        
+        // Get base color from material
+        if (mesh.materialIndex >= 0 && mesh.materialIndex < (int)model->materials.size()) {
+            memcpy(pc.baseColor, model->materials[mesh.materialIndex].baseColorFactor, sizeof(float) * 4);
+        } else {
+            pc.baseColor[0] = pc.baseColor[1] = pc.baseColor[2] = 0.8f;
+            pc.baseColor[3] = 1.0f;
+        }
+        
+        // Push constants
+        vkCmdPushConstants(cmdBuffer, m_controllerPipelineLayout,
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(ControllerModelPushConstants), &pc);
+        
+        // Bind vertex and index buffers
+        VkBuffer vertexBuffers[] = {mesh.vertexBuffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(cmdBuffer, 0, 1, vertexBuffers, offsets);
+        vkCmdBindIndexBuffer(cmdBuffer, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+        
+        // Draw
+        vkCmdDrawIndexed(cmdBuffer, mesh.indexCount, 1, 0, 0, 0);
+    }
+    
+    if (thisFrameDraws > 0 && drawCallCount == 0) {
+        Logger::info(str::format("VRCompositor: Drew ", thisFrameDraws, " controller meshes"));
+    }
+    drawCallCount++;
+}
+
+void VRCompositor::ComputeControllerMVP(const ControllerModel* model, int eye, XrTime displayTime, float* mvpOut) {
+    // Get view-projection matrix
+    float viewProjMatrix[16];
+    if (!CalculateMVPMatrixForEye(eye, displayTime, viewProjMatrix)) {
+        IdentityMatrix(mvpOut);
+        return;
+    }
+    
+    // Controller pose to matrix
+    float poseMatrix[16];
+    QuaternionToMatrix(model->currentPose.orientation.x, model->currentPose.orientation.y,
+                      model->currentPose.orientation.z, model->currentPose.orientation.w, poseMatrix);
+    poseMatrix[12] = model->currentPose.position.x;
+    poseMatrix[13] = model->currentPose.position.y;
+    poseMatrix[14] = model->currentPose.position.z;
+    
+    // MVP = viewProj * model
+    MultiplyMatrices(viewProjMatrix, poseMatrix, mvpOut);
 }
 
 } // namespace dxvk

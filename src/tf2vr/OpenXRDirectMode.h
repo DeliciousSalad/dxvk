@@ -223,6 +223,42 @@ private:
 	
 	// VR Compositor for independent menu rendering
 	std::unique_ptr<dxvk::VRCompositor> m_vrCompositor;
+
+	// XR_EXT_render_model function pointers
+	PFN_xrCreateRenderModelEXT m_pfnCreateRenderModelEXT = nullptr;
+	PFN_xrDestroyRenderModelEXT m_pfnDestroyRenderModelEXT = nullptr;
+	PFN_xrGetRenderModelPropertiesEXT m_pfnGetRenderModelPropertiesEXT = nullptr;
+	PFN_xrCreateRenderModelSpaceEXT m_pfnCreateRenderModelSpaceEXT = nullptr;
+	PFN_xrCreateRenderModelAssetEXT m_pfnCreateRenderModelAssetEXT = nullptr;
+	PFN_xrDestroyRenderModelAssetEXT m_pfnDestroyRenderModelAssetEXT = nullptr;
+	PFN_xrGetRenderModelAssetDataEXT m_pfnGetRenderModelAssetDataEXT = nullptr;
+	PFN_xrGetRenderModelAssetPropertiesEXT m_pfnGetRenderModelAssetPropertiesEXT = nullptr;
+	PFN_xrGetRenderModelStateEXT m_pfnGetRenderModelStateEXT = nullptr;
+
+	// XR_EXT_interaction_render_model function pointers
+	PFN_xrEnumerateInteractionRenderModelIdsEXT m_pfnEnumerateInteractionRenderModelIdsEXT = nullptr;
+	PFN_xrEnumerateRenderModelSubactionPathsEXT m_pfnEnumerateRenderModelSubactionPathsEXT = nullptr;
+	PFN_xrGetRenderModelPoseTopLevelUserPathEXT m_pfnGetRenderModelPoseTopLevelUserPathEXT = nullptr;
+
+	// Flag indicating if render model extensions are available
+	bool m_renderModelExtensionsLoaded = false;
+
+public:
+	// Public accessors for render model functions (used by VRCompositor)
+	bool HasRenderModelSupport() const { return m_renderModelExtensionsLoaded; }
+	PFN_xrEnumerateInteractionRenderModelIdsEXT GetEnumerateInteractionRenderModelIdsEXT() const { return m_pfnEnumerateInteractionRenderModelIdsEXT; }
+	PFN_xrCreateRenderModelEXT GetCreateRenderModelEXT() const { return m_pfnCreateRenderModelEXT; }
+	PFN_xrDestroyRenderModelEXT GetDestroyRenderModelEXT() const { return m_pfnDestroyRenderModelEXT; }
+	PFN_xrGetRenderModelPropertiesEXT GetRenderModelPropertiesEXT() const { return m_pfnGetRenderModelPropertiesEXT; }
+	PFN_xrCreateRenderModelSpaceEXT GetCreateRenderModelSpaceEXT() const { return m_pfnCreateRenderModelSpaceEXT; }
+	PFN_xrCreateRenderModelAssetEXT GetCreateRenderModelAssetEXT() const { return m_pfnCreateRenderModelAssetEXT; }
+	PFN_xrDestroyRenderModelAssetEXT GetDestroyRenderModelAssetEXT() const { return m_pfnDestroyRenderModelAssetEXT; }
+	PFN_xrGetRenderModelAssetDataEXT GetRenderModelAssetDataEXT() const { return m_pfnGetRenderModelAssetDataEXT; }
+	PFN_xrGetRenderModelAssetPropertiesEXT GetRenderModelAssetPropertiesEXT() const { return m_pfnGetRenderModelAssetPropertiesEXT; }
+	PFN_xrGetRenderModelStateEXT GetRenderModelStateEXT() const { return m_pfnGetRenderModelStateEXT; }
+	PFN_xrGetRenderModelPoseTopLevelUserPathEXT GetRenderModelPoseTopLevelUserPathEXT() const { return m_pfnGetRenderModelPoseTopLevelUserPathEXT; }
+	PFN_xrEnumerateRenderModelSubactionPathsEXT GetEnumerateRenderModelSubactionPathsEXT() const { return m_pfnEnumerateRenderModelSubactionPathsEXT; }
+	XrInstance GetXrInstance() const { return m_instance; }
 };
 
 #endif //OPENXRDIRECTMODE_H_INCLUDED

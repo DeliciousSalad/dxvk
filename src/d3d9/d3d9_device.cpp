@@ -653,7 +653,7 @@ namespace dxvk {
     desc.Pool               = Pool;
     desc.Discard            = FALSE;
     // desc.MultiSample        = D3DMULTISAMPLE_NONE;
-    desc.MultiSample        = (D3DMULTISAMPLE_TYPE)OpenXRDirectMode::Get()->DetermineMSAA(Width, Height);
+    desc.MultiSample        = (D3DMULTISAMPLE_TYPE)::OpenXRDirectMode::Get()->DetermineMSAA(Width, Height);
     desc.MultisampleQuality = 0;
     desc.IsBackBuffer       = FALSE;
     desc.IsAttachmentOnly   = FALSE;
@@ -4304,7 +4304,7 @@ namespace dxvk {
     desc.Format             = EnumerateFormat(Format);
     desc.Pool               = D3DPOOL_DEFAULT;
     desc.Discard            = Discard;
-    desc.MultiSample        = std::max(MultiSample, (D3DMULTISAMPLE_TYPE)OpenXRDirectMode::Get()->DetermineMSAA(Width, Height));
+    desc.MultiSample        = std::max(MultiSample, (D3DMULTISAMPLE_TYPE)::OpenXRDirectMode::Get()->DetermineMSAA(Width, Height));
     desc.MultisampleQuality = MultisampleQuality;
     desc.IsBackBuffer       = FALSE;
     desc.IsAttachmentOnly   = TRUE;

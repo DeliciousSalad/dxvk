@@ -11,6 +11,8 @@ d3d9_shaders = files([
 
   'shaders/tf2vr_vr_quad_frag.frag',
   'shaders/tf2vr_vr_quad_vert.vert',
+  'shaders/tf2vr_controller_model_frag.frag',
+  'shaders/tf2vr_controller_model_vert.vert',
 ])
 
 d3d9_src = [
@@ -53,6 +55,7 @@ d3d9_src = [
   '../tf2vr/HMDInterface.cpp',
   '../tf2vr/OpenXRDirectMode.cpp',
   '../tf2vr/VRCompositor.cpp',
+  '../tf2vr/VRControllerModel.cpp',
 ]
 
 d3d9_ld_args      = []

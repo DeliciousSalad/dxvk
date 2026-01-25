@@ -192,6 +192,43 @@ bool OpenXRDirectMode::Init(XrInstance instance, XrSystemId systemId, XrSession 
 	m_headSpace = headSpace;
 	m_systemId = systemId;
 
+	// Load XR_EXT_render_model function pointers
+	m_renderModelExtensionsLoaded = true;
+	
+	auto loadExtFn = [this](const char* name, PFN_xrVoidFunction* outFn) -> bool {
+		XrResult result = xrGetInstanceProcAddr(m_instance, name, outFn);
+		if (XR_FAILED(result) || *outFn == nullptr) {
+			Logger::warn(str::format("OpenXRDirectMode: Failed to load ", name));
+			return false;
+		}
+		return true;
+	};
+
+	// XR_EXT_render_model functions
+	if (!loadExtFn("xrCreateRenderModelEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnCreateRenderModelEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrDestroyRenderModelEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnDestroyRenderModelEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrGetRenderModelPropertiesEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnGetRenderModelPropertiesEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrCreateRenderModelSpaceEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnCreateRenderModelSpaceEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrCreateRenderModelAssetEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnCreateRenderModelAssetEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrDestroyRenderModelAssetEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnDestroyRenderModelAssetEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrGetRenderModelAssetDataEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnGetRenderModelAssetDataEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrGetRenderModelAssetPropertiesEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnGetRenderModelAssetPropertiesEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrGetRenderModelStateEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnGetRenderModelStateEXT))) m_renderModelExtensionsLoaded = false;
+
+	// XR_EXT_interaction_render_model functions
+	if (!loadExtFn("xrEnumerateInteractionRenderModelIdsEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnEnumerateInteractionRenderModelIdsEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrEnumerateRenderModelSubactionPathsEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnEnumerateRenderModelSubactionPathsEXT))) m_renderModelExtensionsLoaded = false;
+	if (!loadExtFn("xrGetRenderModelPoseTopLevelUserPathEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfnGetRenderModelPoseTopLevelUserPathEXT))) m_renderModelExtensionsLoaded = false;
+
+	if (m_renderModelExtensionsLoaded) {
+		Logger::info("OpenXRDirectMode: XR_EXT_render_model and XR_EXT_interaction_render_model extensions loaded successfully");
+		Logger::info(str::format("OpenXRDirectMode: Function pointers - enumModels=", (void*)m_pfnEnumerateInteractionRenderModelIdsEXT,
+			" createModel=", (void*)m_pfnCreateRenderModelEXT));
+	} else {
+		Logger::warn("OpenXRDirectMode: Render model extensions not fully available - controller models will not be rendered");
+		Logger::warn(str::format("OpenXRDirectMode: Check which function failed to load"));
+	}
+
 	// Create query pool for GPU timing
 	VkQueryPoolCreateInfo queryPoolInfo = {};
 	queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;

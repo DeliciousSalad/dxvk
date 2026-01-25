@@ -7,11 +7,18 @@
 #include <condition_variable>
 #include <vector>
 #include <chrono>
+#include <memory>
 
+// Must define Win32 platform before including Vulkan headers
+#ifdef _WIN32
+#define VK_USE_PLATFORM_WIN32_KHR 1
+#endif
 #include "vulkan/vulkan.h"
 #include "openxr/openxr.h"
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "openxr/openxr_platform.h"
+
+#include "VRControllerModel.h"
 
 // Forward declarations
 class OpenXRDirectMode;
@@ -44,7 +51,7 @@ private:
     std::atomic<bool> m_shouldStop{false};
     
     // OpenXR session access (shared with main DXVK)
-    OpenXRDirectMode* m_pOpenXRManager = nullptr;
+    ::OpenXRDirectMode* m_pOpenXRManager = nullptr;
     
     // Cached values to avoid calling OpenXRDirectMode methods (avoid circular dependency)
     VkPhysicalDevice m_cachedPhysicalDevice = VK_NULL_HANDLE;
@@ -149,6 +156,38 @@ private:
     VkSampler m_maskTextureSampler = VK_NULL_HANDLE;
     bool m_maskTextureLoaded = false;
     
+    // =========================================================================
+    // Controller Model Rendering
+    // =========================================================================
+    
+    // Controller model manager
+    std::unique_ptr<VRControllerModelManager> m_controllerModelManager;
+    bool m_controllerModelsLoaded = false;
+    bool m_controllerModelsInitialized = false;
+    
+    // Depth buffer resources (per-eye)
+    VkImage m_depthImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory m_depthMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView m_depthImageViews[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkFormat m_depthFormat = VK_FORMAT_D32_SFLOAT;
+    
+    // Controller model render pass (with depth attachment)
+    VkRenderPass m_controllerRenderPass = VK_NULL_HANDLE;
+    
+    // Controller model graphics pipeline
+    VkPipeline m_controllerPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout m_controllerPipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_controllerDescriptorSetLayout = VK_NULL_HANDLE;
+    
+    // Controller model shaders
+    VkShaderModule m_controllerVertShader = VK_NULL_HANDLE;
+    VkShaderModule m_controllerFragShader = VK_NULL_HANDLE;
+    
+    // Framebuffers for controller rendering (per-eye, includes depth)
+    VkFramebuffer m_controllerFramebuffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    
+    bool m_controllerPipelineCreated = false;
+    
     // Frame submission data
     struct FrameData {
         void* textureHandle = nullptr;
@@ -165,8 +204,8 @@ public:
     ~VRCompositor();
     
     // Initialization and lifecycle
-    void SetOpenXRManager(OpenXRDirectMode* manager);
-    OpenXRDirectMode* GetOpenXRManager() const { return m_pOpenXRManager; }
+    void SetOpenXRManager(::OpenXRDirectMode* manager);
+    ::OpenXRDirectMode* GetOpenXRManager() const { return m_pOpenXRManager; }
     void CacheOpenXRData(VkPhysicalDevice physicalDevice, VkInstance instance, XrSession session, XrSpace referenceSpace, uint32_t width, uint32_t height);
     bool Initialize();
     void Shutdown();
@@ -195,6 +234,11 @@ public:
     
     // Get the current predicted display time for input synchronization
     XrTime GetCurrentPredictedDisplayTime() const;
+    
+    // Controller model rendering
+    bool InitializeControllerModels();
+    void RenderControllerModels(int eye, VkCommandBuffer cmdBuffer, XrTime displayTime);
+    bool AreControllerModelsLoaded() const { return m_controllerModelsLoaded; }
 
 private:
     // Frame state for input synchronization
@@ -266,6 +310,21 @@ private:
     void StartCompositor();
     void StopCompositor();
     bool RunIndependentFrame();
+    
+    // Controller model rendering pipeline setup
+    bool CreateDepthResources();
+    bool CreateControllerRenderPass();
+    bool CreateControllerShaderModules();
+    bool CreateControllerPipelineLayout();
+    bool CreateControllerGraphicsPipeline();
+    bool CreateControllerFramebuffers();
+    bool EnsureControllerPipelineCreated();
+    void CleanupControllerResources();
+    
+    // Controller model helper methods
+    void RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const ControllerModel* model, 
+                                      const float* viewProjMatrix, XrTime displayTime);
+    void ComputeControllerMVP(const ControllerModel* model, int eye, XrTime displayTime, float* mvpOut);
 };
 
 } // namespace dxvk
