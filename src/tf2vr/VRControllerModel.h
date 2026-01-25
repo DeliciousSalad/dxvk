@@ -74,10 +74,17 @@ struct ControllerMesh {
 
 // Material properties extracted from glTF
 struct ControllerMaterial {
-    // Base color texture
+    // Base color texture (Vulkan resources)
     VkImage texture = VK_NULL_HANDLE;
     VkImageView textureView = VK_NULL_HANDLE;
     VkDeviceMemory textureMemory = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    
+    // Temporary storage for decoded texture pixels
+    std::vector<uint8_t> texturePixels;
+    int textureWidth = 0;
+    int textureHeight = 0;
     
     // Base color factor (RGBA)
     float baseColorFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -85,6 +92,9 @@ struct ControllerMaterial {
     // Metallic-roughness
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
+    
+    // Emissive
+    float emissiveFactor[3] = {0.0f, 0.0f, 0.0f};
     
     bool hasTexture = false;
 };
@@ -151,7 +161,8 @@ struct ControllerModel {
 struct ControllerModelPushConstants {
     float mvpMatrix[16];     // Model-View-Projection matrix
     float modelMatrix[16];   // Model matrix (for normal transform)
-    float baseColor[4];      // Base color factor
+    float baseColor[4];      // Base color factor (RGBA)
+    float emissive[4];       // Emissive factor (RGB + hasTexture flag in W)
 };
 
 // Manager class for loading and managing controller models

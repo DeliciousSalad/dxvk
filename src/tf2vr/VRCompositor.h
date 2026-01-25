@@ -178,6 +178,15 @@ private:
     VkPipeline m_controllerPipeline = VK_NULL_HANDLE;
     VkPipelineLayout m_controllerPipelineLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_controllerDescriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_controllerDescriptorPool = VK_NULL_HANDLE;
+    VkSampler m_controllerTextureSampler = VK_NULL_HANDLE;
+    bool m_controllerTexturesUploaded = false;
+    
+    // Fallback white texture for controllers (used when no material texture)
+    VkImage m_controllerFallbackTexture = VK_NULL_HANDLE;
+    VkDeviceMemory m_controllerFallbackMemory = VK_NULL_HANDLE;
+    VkImageView m_controllerFallbackView = VK_NULL_HANDLE;
+    VkDescriptorSet m_controllerFallbackDescriptorSet = VK_NULL_HANDLE;
     
     // Controller model shaders
     VkShaderModule m_controllerVertShader = VK_NULL_HANDLE;
@@ -320,6 +329,8 @@ private:
     bool CreateControllerFramebuffers();
     bool EnsureControllerPipelineCreated();
     void CleanupControllerResources();
+    bool UploadControllerTextures();
+    bool CreateControllerTextureSampler();
     
     // Controller model helper methods
     void RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const ControllerModel* model, 
