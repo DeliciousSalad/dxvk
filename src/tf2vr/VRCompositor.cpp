@@ -2358,21 +2358,28 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
     }
     if (m_controllerModelsLoaded && m_controllerModelManager && m_controllerPipelineCreated) {
         // Update controller animation state (positions, visibility) for this frame
+        // This also polls OpenXR events for session focus changes
         m_controllerModelManager->UpdateAnimationState(displayTime);
         
-        // Calculate view-projection matrix for this eye
-        float viewProjMatrix[16];
-        if (CalculateMVPMatrixForEye(eye, displayTime, viewProjMatrix)) {
-            // Render left controller
-            const ControllerModel* leftModel = m_controllerModelManager->GetLeftController();
-            if (leftModel && leftModel->isLoaded) {
-                RenderSingleControllerModel(m_compositorCommandBuffer, leftModel, viewProjMatrix, displayTime);
-            }
-            
-            // Render right controller  
-            const ControllerModel* rightModel = m_controllerModelManager->GetRightController();
-            if (rightModel && rightModel->isLoaded) {
-                RenderSingleControllerModel(m_compositorCommandBuffer, rightModel, viewProjMatrix, displayTime);
+        // Skip rendering when SteamVR overlay is open (session not focused)
+        bool sessionFocused = m_pOpenXRManager ? m_pOpenXRManager->IsSessionFocused() : true;
+        if (!sessionFocused) {
+            // Don't render our controllers - SteamVR renders its own
+        } else {
+            // Calculate view-projection matrix for this eye
+            float viewProjMatrix[16];
+            if (CalculateMVPMatrixForEye(eye, displayTime, viewProjMatrix)) {
+                // Render left controller
+                const ControllerModel* leftModel = m_controllerModelManager->GetLeftController();
+                if (leftModel && leftModel->isLoaded) {
+                    RenderSingleControllerModel(m_compositorCommandBuffer, leftModel, viewProjMatrix, displayTime);
+                }
+                
+                // Render right controller  
+                const ControllerModel* rightModel = m_controllerModelManager->GetRightController();
+                if (rightModel && rightModel->isLoaded) {
+                    RenderSingleControllerModel(m_compositorCommandBuffer, rightModel, viewProjMatrix, displayTime);
+                }
             }
         }
     }
@@ -3951,69 +3958,9 @@ void VRCompositor::CleanupControllerResources() {
     Logger::info("VRCompositor: Controller resources cleaned up");
 }
 
-void VRCompositor::RenderControllerModels(int eye, VkCommandBuffer cmdBuffer, XrTime displayTime) {
-    if (!m_controllerModelsLoaded || !m_controllerModelManager) return;
-    
-    // Ensure the controller rendering pipeline is created
-    if (!m_controllerPipelineCreated) {
-        if (!EnsureControllerPipelineCreated()) {
-            Logger::warn("VRCompositor: Failed to create controller pipeline");
-            return;
-        }
-        Logger::info("VRCompositor: Controller rendering pipeline created");
-    }
-    
-    if (m_controllerPipeline == VK_NULL_HANDLE) return;
-    
-    // Update animation state for this frame
-    m_controllerModelManager->UpdateAnimationState(displayTime);
-    
-    // Calculate view-projection matrix for this eye
-    float viewProjMatrix[16];
-    if (!CalculateMVPMatrixForEye(eye, displayTime, viewProjMatrix)) {
-        return;
-    }
-    
-    // Render left controller
-    const ControllerModel* leftModel = m_controllerModelManager->GetLeftController();
-    if (leftModel && leftModel->isLoaded) {
-        static bool loggedLeft = false;
-        if (!loggedLeft) {
-            Logger::info(str::format("VRCompositor: Rendering left controller (visible=", leftModel->isVisible, 
-                " meshes=", leftModel->meshes.size(), ")"));
-            loggedLeft = true;
-        }
-        RenderSingleControllerModel(cmdBuffer, leftModel, viewProjMatrix, displayTime);
-    }
-    
-    // Render right controller
-    const ControllerModel* rightModel = m_controllerModelManager->GetRightController();
-    if (rightModel && rightModel->isLoaded) {
-        static bool loggedRight = false;
-        if (!loggedRight) {
-            Logger::info(str::format("VRCompositor: Rendering right controller (visible=", rightModel->isVisible,
-                " meshes=", rightModel->meshes.size(), ")"));
-            loggedRight = true;
-        }
-        RenderSingleControllerModel(cmdBuffer, rightModel, viewProjMatrix, displayTime);
-    }
-}
-
 void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const ControllerModel* model,
                                                 const float* viewProjMatrix, XrTime displayTime) {
     if (!model || !model->isLoaded) return;
-    
-    static bool loggedOnce = false;
-    if (!loggedOnce) {
-        Logger::info(str::format("VRCompositor: RenderSingleControllerModel - nodes=", model->nodes.size(), 
-            " meshes=", model->meshes.size()));
-        Logger::info(str::format("VRCompositor: Controller pose position: x=", model->currentPose.position.x,
-            " y=", model->currentPose.position.y, " z=", model->currentPose.position.z));
-        Logger::info(str::format("VRCompositor: Controller pose orientation: x=", model->currentPose.orientation.x,
-            " y=", model->currentPose.orientation.y, " z=", model->currentPose.orientation.z, 
-            " w=", model->currentPose.orientation.w));
-        loggedOnce = true;
-    }
     
     // Bind the controller pipeline
     vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_controllerPipeline);
@@ -4034,8 +3981,6 @@ void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const 
     vkCmdSetScissor(cmdBuffer, 0, 1, &scissor);
     
     // For each node with a mesh
-    static int drawCallCount = 0;
-    int thisFrameDraws = 0;
     for (size_t nodeIdx = 0; nodeIdx < model->nodes.size(); nodeIdx++) {
         const ControllerNode& node = model->nodes[nodeIdx];
         if (node.meshIndex < 0) continue;
@@ -4044,7 +3989,6 @@ void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const 
         
         const ControllerMesh& mesh = model->meshes[node.meshIndex];
         if (mesh.vertexBuffer == VK_NULL_HANDLE || mesh.indexCount == 0) continue;
-        thisFrameDraws++;
         
         // Compute MVP for this node
         ControllerModelPushConstants pc = {};
@@ -4070,27 +4014,13 @@ void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const 
         poseMatrix[5] = -poseMatrix[5];
         poseMatrix[9] = -poseMatrix[9];
         
-        MultiplyMatrices(poseMatrix, node.worldMatrix, modelMatrix);
+        // Note: matrices are column-major but MultiplyMatrices is row-major
+        // Swap order so worldMatrix is applied first (in model space), then poseMatrix
+        MultiplyMatrices(node.worldMatrix, poseMatrix, modelMatrix);
         memcpy(pc.modelMatrix, modelMatrix, sizeof(float) * 16);
         
         // Pass viewProj directly - shader will apply model transform itself
-        // This matches how the quad works: viewProj transforms world-space vertices to clip space
         memcpy(pc.mvpMatrix, viewProjMatrix, sizeof(float) * 16);
-        
-        // Debug: log matrices and mesh info once
-        static bool loggedMVP = false;
-        if (!loggedMVP) {
-            Logger::info(str::format("VRCompositor: Node worldMatrix[0-3]=", node.worldMatrix[0], " ", node.worldMatrix[1], " ", node.worldMatrix[2], " ", node.worldMatrix[3]));
-            Logger::info(str::format("VRCompositor: Node worldMatrix[12-15]=", node.worldMatrix[12], " ", node.worldMatrix[13], " ", node.worldMatrix[14], " ", node.worldMatrix[15]));
-            Logger::info(str::format("VRCompositor: ModelMatrix[0-3]=", modelMatrix[0], " ", modelMatrix[1], " ", modelMatrix[2], " ", modelMatrix[3]));
-            Logger::info(str::format("VRCompositor: ModelMatrix[12-15]=", modelMatrix[12], " ", modelMatrix[13], " ", modelMatrix[14], " ", modelMatrix[15]));
-            Logger::info(str::format("VRCompositor: ViewProj[0-3]=", viewProjMatrix[0], " ", viewProjMatrix[1], " ", viewProjMatrix[2], " ", viewProjMatrix[3]));
-            Logger::info(str::format("VRCompositor: ViewProj[12-15]=", viewProjMatrix[12], " ", viewProjMatrix[13], " ", viewProjMatrix[14], " ", viewProjMatrix[15]));
-            Logger::info(str::format("VRCompositor: MVP[0-3]=", pc.mvpMatrix[0], " ", pc.mvpMatrix[1], " ", pc.mvpMatrix[2], " ", pc.mvpMatrix[3]));
-            Logger::info(str::format("VRCompositor: MVP[12-15]=", pc.mvpMatrix[12], " ", pc.mvpMatrix[13], " ", pc.mvpMatrix[14], " ", pc.mvpMatrix[15]));
-            Logger::info(str::format("VRCompositor: Mesh vertices=", mesh.vertices.size(), " indexCount=", mesh.indexCount));
-            loggedMVP = true;
-        }
         
         // Get base color, emissive, and texture from material
         VkDescriptorSet dsToUse = m_controllerFallbackDescriptorSet;
@@ -4106,19 +4036,6 @@ void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const 
             if (mat.descriptorSet != VK_NULL_HANDLE) {
                 dsToUse = mat.descriptorSet;
                 pc.emissive[3] = 1.0f;  // hasTexture flag
-            }
-            
-            // Log material info once
-            static bool loggedMat = false;
-            if (!loggedMat) {
-                Logger::info(str::format("VRCompositor: Material ", mesh.materialIndex, 
-                    " baseColor=(", mat.baseColorFactor[0], ",", mat.baseColorFactor[1], ",", 
-                    mat.baseColorFactor[2], ",", mat.baseColorFactor[3], ")",
-                    " emissive=(", mat.emissiveFactor[0], ",", mat.emissiveFactor[1], ",", mat.emissiveFactor[2], ")",
-                    " hasTexture=", mat.hasTexture, 
-                    " texSize=", mat.textureWidth, "x", mat.textureHeight,
-                    " descriptorSet=", (mat.descriptorSet != VK_NULL_HANDLE)));
-                loggedMat = true;
             }
         } else {
             pc.baseColor[0] = pc.baseColor[1] = pc.baseColor[2] = 0.8f;
@@ -4145,11 +4062,6 @@ void VRCompositor::RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const 
         // Draw
         vkCmdDrawIndexed(cmdBuffer, mesh.indexCount, 1, 0, 0, 0);
     }
-    
-    if (thisFrameDraws > 0 && drawCallCount == 0) {
-        Logger::info(str::format("VRCompositor: Drew ", thisFrameDraws, " controller meshes"));
-    }
-    drawCallCount++;
 }
 
 void VRCompositor::ComputeControllerMVP(const ControllerModel* model, int eye, XrTime displayTime, float* mvpOut) {

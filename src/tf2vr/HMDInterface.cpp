@@ -35,6 +35,15 @@ extern "C" bool __declspec(dllexport) dxvkInitOpenXR(XrInstance instance, XrSyst
 	return result;
 }
 
+extern "C" void __declspec(dllexport) dxvkSetSessionFocused(bool focused)
+{
+	// Session focus is now detected directly via xrPollEvent in VRControllerModel
+	// This function is kept for backwards compatibility but is no longer needed
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		openxr->SetSessionFocused(focused);
+	}
+}
 
 extern "C" bool __declspec(dllexport) dxvkBeginFrame()
 {

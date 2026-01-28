@@ -246,7 +246,6 @@ public:
     
     // Controller model rendering
     bool InitializeControllerModels();
-    void RenderControllerModels(int eye, VkCommandBuffer cmdBuffer, XrTime displayTime);
     bool AreControllerModelsLoaded() const { return m_controllerModelsLoaded; }
 
 private:

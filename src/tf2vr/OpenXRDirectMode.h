@@ -107,6 +107,7 @@ public:
 	// Public accessor methods for VRCompositor
 	XrSession GetSession() const { return m_session; }
 	XrSpace GetReferenceSpace() const { return m_referenceSpace; }
+	XrInstance GetInstance() const { return m_instance; }
 	VkDevice GetVulkanDevice() const { return m_vkDevice; }
 	VkQueue GetVulkanQueue() const { return m_vkQueue; }
 	uint32_t GetRenderWidth() const { return m_nRenderWidth; }
@@ -118,10 +119,16 @@ public:
 	uint32_t GetGraphicsQueueFamily() const { return m_vkQueueFamilyIndex; }
 	VkPhysicalDevice GetVulkanPhysicalDevice() const { return m_vkPhysicalDevice; }
 	VkInstance GetVulkanInstance() const { return m_vkInstance; }
+	
+	// Session focus (set by game when overlay opens/closes)
+	void SetSessionFocused(bool focused) { m_sessionFocused = focused; }
+	bool IsSessionFocused() const { return m_sessionFocused; }
+	
         void GetViewsPublic(XrView* views, XrSpaceLocation& headLocation, uint32_t& viewCount);
         void ResetFrameState(); // Reset frame tracking for compositor takeover
 
 private:
+	bool m_sessionFocused = true;
 	uint32_t m_nRenderWidth;
 	uint32_t m_nRenderHeight;
 	int m_nMSAA;
@@ -141,6 +148,7 @@ private:
 	bool m_bFrameStarted = false;
 	std::atomic<bool> m_bFrameRunning{false};
 	bool m_bSubmitCalled = false;
+	
 
 	// Synchronization
 	std::atomic<bool> m_bPosesStale = { true };

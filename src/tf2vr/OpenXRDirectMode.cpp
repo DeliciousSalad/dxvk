@@ -1391,6 +1391,7 @@ bool OpenXRDirectMode::WaitPoses()
 
 	Logger::info("OpenXRDirectMode: WaitPoses called");
 
+
 	// Prepare the next frame and wait for the predicted display time
 	XrFrameWaitInfo frameWaitInfo = { XR_TYPE_FRAME_WAIT_INFO };
 	

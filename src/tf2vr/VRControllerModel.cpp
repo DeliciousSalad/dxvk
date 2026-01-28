@@ -403,6 +403,43 @@ bool VRControllerModelManager::LoadControllerModels(XrSession session) {
             continue;
         }
         
+        // Build mapping from OpenXR animatable node index to GLTF node index
+        // Use xrGetRenderModelAssetPropertiesEXT to get animatable node names
+        auto getAssetProps = m_openxrManager->GetRenderModelAssetPropertiesEXT();
+        if (getAssetProps && targetModel.animatableNodeCount > 0) {
+            // Get the animatable node names
+            std::vector<XrRenderModelAssetNodePropertiesEXT> nodeProps(targetModel.animatableNodeCount);
+            XrRenderModelAssetPropertiesEXT assetProps = {XR_TYPE_RENDER_MODEL_ASSET_PROPERTIES_EXT};
+            assetProps.nodePropertyCount = targetModel.animatableNodeCount;
+            assetProps.nodeProperties = nodeProps.data();
+            
+            XrRenderModelAssetPropertiesGetInfoEXT propsGetInfo = {XR_TYPE_RENDER_MODEL_ASSET_PROPERTIES_GET_INFO_EXT};
+            XrResult propsResult = getAssetProps(targetModel.assetHandle, &propsGetInfo, &assetProps);
+            
+            if (XR_SUCCEEDED(propsResult)) {
+                targetModel.animNodeToGltfNode.resize(targetModel.animatableNodeCount, -1);
+                
+                for (uint32_t animIdx = 0; animIdx < assetProps.nodePropertyCount; animIdx++) {
+                    std::string animNodeName(nodeProps[animIdx].uniqueName);
+                    
+                    // Find matching GLTF node by name
+                    for (size_t gltfIdx = 0; gltfIdx < targetModel.nodes.size(); gltfIdx++) {
+                        if (targetModel.nodes[gltfIdx].name == animNodeName) {
+                            targetModel.animNodeToGltfNode[animIdx] = static_cast<int>(gltfIdx);
+                            break;
+                        }
+                    }
+                    
+                    if (targetModel.animNodeToGltfNode[animIdx] < 0) {
+                        Logger::warn(str::format("VRControllerModelManager: OpenXR anim node '", 
+                                                 animNodeName, "' has no matching GLTF node"));
+                    }
+                }
+            } else {
+                Logger::warn("VRControllerModelManager: Failed to get asset properties for animation mapping");
+            }
+        }
+        
         // Create Vulkan resources
         if (!CreateModelVulkanResources(targetModel)) {
             Logger::err("VRControllerModelManager: Failed to create Vulkan resources for model");
@@ -429,6 +466,25 @@ bool VRControllerModelManager::LoadControllerModels(XrSession session) {
 void VRControllerModelManager::UpdateAnimationState(XrTime displayTime) {
     if (!m_openxrManager || !m_openxrManager->HasRenderModelSupport()) return;
     
+    // Poll for session state changes to detect SteamVR overlay
+    XrInstance instance = m_openxrManager->GetInstance();
+    if (instance != XR_NULL_HANDLE) {
+        XrEventDataBuffer eventBuffer = {XR_TYPE_EVENT_DATA_BUFFER};
+        XrResult pollResult = xrPollEvent(instance, &eventBuffer);
+        while (pollResult == XR_SUCCESS) {
+            if (eventBuffer.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+                auto* stateEvent = reinterpret_cast<XrEventDataSessionStateChanged*>(&eventBuffer);
+                if (stateEvent->state == XR_SESSION_STATE_FOCUSED) {
+                    m_openxrManager->SetSessionFocused(true);
+                } else if (stateEvent->state == XR_SESSION_STATE_VISIBLE) {
+                    m_openxrManager->SetSessionFocused(false);
+                }
+            }
+            eventBuffer = {XR_TYPE_EVENT_DATA_BUFFER};
+            pollResult = xrPollEvent(instance, &eventBuffer);
+        }
+    }
+    
     auto getState = m_openxrManager->GetRenderModelStateEXT();
     if (!getState) return;
     
@@ -444,23 +500,31 @@ void VRControllerModelManager::UpdateAnimationState(XrTime displayTime) {
         
         XrResult result = getState(model.renderModel, &stateGetInfo, &state);
         if (XR_SUCCEEDED(result)) {
-            // Update node visibility and poses based on animation state
-            for (uint32_t i = 0; i < state.nodeStateCount && i < model.nodes.size(); i++) {
-                if (model.nodes[i].isAnimatable) {
-                    model.nodes[i].isVisible = model.nodeStates[i].isVisible;
-                    
-                    // Update the node's local transform from the animated pose
-                    const XrPosef& pose = model.nodeStates[i].nodePose;
-                    model.nodes[i].translation[0] = pose.position.x;
-                    model.nodes[i].translation[1] = pose.position.y;
-                    model.nodes[i].translation[2] = pose.position.z;
-                    model.nodes[i].rotation[0] = pose.orientation.x;
-                    model.nodes[i].rotation[1] = pose.orientation.y;
-                    model.nodes[i].rotation[2] = pose.orientation.z;
-                    model.nodes[i].rotation[3] = pose.orientation.w;
-                    
-                    model.nodes[i].ComputeLocalMatrix();
+            // Apply animation using the correct mapping
+            for (uint32_t animIdx = 0; animIdx < state.nodeStateCount; animIdx++) {
+                // Use mapping to find correct GLTF node
+                int gltfIdx = (animIdx < model.animNodeToGltfNode.size()) 
+                              ? model.animNodeToGltfNode[animIdx] : -1;
+                
+                if (gltfIdx < 0 || gltfIdx >= static_cast<int>(model.nodes.size())) {
+                    continue;  // No valid mapping for this animation state
                 }
+                
+                ControllerNode& node = model.nodes[gltfIdx];
+                const XrRenderModelNodeStateEXT& animState = model.nodeStates[animIdx];
+                
+                node.isVisible = animState.isVisible;
+                
+                // Apply the OpenXR pose as the node's local transform
+                const XrPosef& pose = animState.nodePose;
+                
+                // Build transform: rotation + translation
+                QuaternionToMatrix(pose.orientation.x, pose.orientation.y, 
+                                   pose.orientation.z, pose.orientation.w, 
+                                   node.localMatrix);
+                node.localMatrix[12] = pose.position.x;
+                node.localMatrix[13] = pose.position.y;
+                node.localMatrix[14] = pose.position.z;
             }
             
             // Recompute world matrices for all nodes
@@ -495,12 +559,6 @@ void VRControllerModelManager::UpdateAnimationState(XrTime displayTime) {
     };
     
     updateModel(m_leftController);
-    static bool loggedPoses = false;
-    if (!loggedPoses && m_leftController.isLoaded && m_rightController.isLoaded) {
-        Logger::info(str::format("VRControllerModelManager: LEFT controller pose X=", m_leftController.currentPose.position.x));
-        Logger::info(str::format("VRControllerModelManager: RIGHT controller pose X=", m_rightController.currentPose.position.x));
-        loggedPoses = true;
-    }
     updateModel(m_rightController);
 }
 
@@ -636,15 +694,10 @@ bool VRControllerModelManager::ParseGLTFModel(const uint8_t* data, size_t size, 
                 }
             }
             
-            // Log vertex bounds for debugging
-            static bool loggedBounds = false;
-            if (!loggedBounds) {
-                Logger::info(str::format("VRControllerModelManager: Mesh bounds min=(", minPos[0], ", ", minPos[1], ", ", minPos[2], 
-                    ") max=(", maxPos[0], ", ", maxPos[1], ", ", maxPos[2], ")"));
-                float size[3] = {maxPos[0] - minPos[0], maxPos[1] - minPos[1], maxPos[2] - minPos[2]};
-                Logger::info(str::format("VRControllerModelManager: Mesh size=(", size[0], ", ", size[1], ", ", size[2], ")"));
-                loggedBounds = true;
-            }
+            // Store mesh center as pivot point for animation
+            mesh.centerX = (minPos[0] + maxPos[0]) * 0.5f;
+            mesh.centerY = (minPos[1] + maxPos[1]) * 0.5f;
+            mesh.centerZ = (minPos[2] + maxPos[2]) * 0.5f;
             
             // Extract indices
             if (prim.indices) {
@@ -679,25 +732,21 @@ bool VRControllerModelManager::ParseGLTFModel(const uint8_t* data, size_t size, 
             dstNode.meshIndex = static_cast<int>(srcNode.mesh - gltf->meshes);
         }
         
-        // Get transform
-        if (srcNode.has_translation) {
-            dstNode.translation[0] = srcNode.translation[0];
-            dstNode.translation[1] = srcNode.translation[1];
-            dstNode.translation[2] = srcNode.translation[2];
-        }
-        if (srcNode.has_rotation) {
-            dstNode.rotation[0] = srcNode.rotation[0];
-            dstNode.rotation[1] = srcNode.rotation[1];
-            dstNode.rotation[2] = srcNode.rotation[2];
-            dstNode.rotation[3] = srcNode.rotation[3];
-        }
-        if (srcNode.has_scale) {
-            dstNode.scale[0] = srcNode.scale[0];
-            dstNode.scale[1] = srcNode.scale[1];
-            dstNode.scale[2] = srcNode.scale[2];
-        }
+        // Get transform - use cgltf helper that handles both TRS and matrix formats
+        float localMat[16];
+        cgltf_node_transform_local(&srcNode, localMat);
         
-        dstNode.ComputeLocalMatrix();
+        // Copy directly to localMatrix (it's already computed)
+        memcpy(dstNode.localMatrix, localMat, sizeof(float) * 16);
+        
+        // Also extract TRS for our internal tracking (in case we need them)
+        // Translation is column 3 (indices 12, 13, 14)
+        dstNode.translation[0] = localMat[12];
+        dstNode.translation[1] = localMat[13];
+        dstNode.translation[2] = localMat[14];
+        
+        // For now, keep rotation/scale at defaults since we have the matrix directly
+        // (extracting quaternion from matrix is complex and we don't need it if we use the matrix)
         
         // Children
         for (size_t c = 0; c < srcNode.children_count; c++) {

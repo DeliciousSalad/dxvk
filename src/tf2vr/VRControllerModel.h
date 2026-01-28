@@ -70,6 +70,9 @@ struct ControllerMesh {
     
     uint32_t indexCount = 0;
     int materialIndex = -1;  // Index into materials array, -1 if none
+    
+    // Mesh center (pivot point for rotation)
+    float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f;
 };
 
 // Material properties extracted from glTF
@@ -147,6 +150,10 @@ struct ControllerModel {
     
     // Animation state buffer (sized to animatableNodeCount)
     std::vector<XrRenderModelNodeStateEXT> nodeStates;
+    
+    // Mapping from OpenXR animatable index to GLTF node index
+    // animNodeToGltfNode[openxrAnimIdx] = gltfNodeIdx (-1 if not found)
+    std::vector<int> animNodeToGltfNode;
     
     // Tracking state
     bool isLoaded = false;
