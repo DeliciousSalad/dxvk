@@ -45,6 +45,15 @@ extern "C" void __declspec(dllexport) dxvkSetSessionFocused(bool focused)
 	}
 }
 
+extern "C" bool __declspec(dllexport) dxvkIsSessionFocused()
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		return openxr->IsSessionFocused();
+	}
+	return true;  // Default to focused if no manager
+}
+
 extern "C" bool __declspec(dllexport) dxvkBeginFrame()
 {
 	// Don't allow normal VR hooks when compositor is active
