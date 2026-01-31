@@ -56,6 +56,7 @@ d3d9_src = [
   '../tf2vr/OpenXRDirectMode.cpp',
   '../tf2vr/VRCompositor.cpp',
   '../tf2vr/VRControllerModel.cpp',
+  '../tf2vr/VRLaserPointer.cpp',
 ]
 
 d3d9_ld_args      = []

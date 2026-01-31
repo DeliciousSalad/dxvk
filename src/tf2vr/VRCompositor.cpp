@@ -1450,6 +1450,10 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
                         } else {
                             Logger::warn("VRCompositor: Failed to upload controller textures (will use base colors)");
                         }
+                        // Initialize laser pointer (needs descriptor set layout from pipeline)
+                        if (!m_laserInitialized) {
+                            InitializeLaserPointer();
+                        }
                     }
                 }
             }
@@ -2364,7 +2368,7 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
         // Skip rendering when SteamVR overlay is open (session not focused)
         bool sessionFocused = m_pOpenXRManager ? m_pOpenXRManager->IsSessionFocused() : true;
         if (!sessionFocused) {
-            // Don't render our controllers - SteamVR renders its own
+            // Don't render our controllers or laser - SteamVR renders its own
         } else {
             // Calculate view-projection matrix for this eye
             float viewProjMatrix[16];
@@ -2379,6 +2383,54 @@ void VRCompositor::Render3DQuad(int eye, VkImage targetImage, XrTime displayTime
                 const ControllerModel* rightModel = m_controllerModelManager->GetRightController();
                 if (rightModel && rightModel->isLoaded) {
                     RenderSingleControllerModel(m_compositorCommandBuffer, rightModel, viewProjMatrix, displayTime);
+                }
+                
+                // Render laser pointer from the active hand using aim pose
+                if (m_laserPointer && m_laserInitialized) {
+                    bool isLeftHand = m_laserPointer->IsLeftHandActive();
+                    XrPosef aimPose;
+                    bool haveAimPose = false;
+                    
+                    // Priority 1: Direct sampling from aim space (independent of game)
+                    if (SampleAimPose(isLeftHand, displayTime, aimPose)) {
+                        haveAimPose = true;
+                    }
+                    // Priority 2: Cached aim pose from game (fallback)
+                    else if (GetControllerAimPose(isLeftHand, aimPose)) {
+                        haveAimPose = true;
+                    }
+                    
+                    if (haveAimPose) {
+                        // Calculate intersection with menu quad
+                        float corners[4][3];
+                        if (GetQuadCorners(corners[0], corners[1], corners[2], corners[3])) {
+                            float intersectDist = m_laserPointer->CalculatePlaneIntersection(
+                                aimPose, corners[0], corners[1], corners[2], corners[3]);
+                            
+                            if (intersectDist > 0.0f) {
+                                m_laserPointer->SetIntersectionLength(intersectDist);
+                            } else {
+                                // No intersection - clear override to use default max length
+                                m_laserPointer->ClearIntersectionLength();
+                            }
+                        } else {
+                            // No quad available - clear override
+                            m_laserPointer->ClearIntersectionLength();
+                        }
+                        
+                        // Use proper aim pose
+                        m_laserPointer->RenderWithPose(m_compositorCommandBuffer, m_controllerPipeline,
+                                                       m_controllerPipelineLayout, aimPose, viewProjMatrix,
+                                                       m_cachedRenderWidth, m_cachedRenderHeight);
+                    } else {
+                        // Fallback to controller model pose (grip pose)
+                        const ControllerModel* laserModel = isLeftHand ? leftModel : rightModel;
+                        if (laserModel && laserModel->isLoaded) {
+                            m_laserPointer->Render(m_compositorCommandBuffer, m_controllerPipeline,
+                                                  m_controllerPipelineLayout, laserModel, viewProjMatrix,
+                                                  m_cachedRenderWidth, m_cachedRenderHeight, isLeftHand);
+                        }
+                    }
                 }
             }
         }
@@ -3304,6 +3356,9 @@ bool VRCompositor::InitializeControllerModels() {
         }
     }
     
+    // Initialize laser pointer
+    InitializeLaserPointer();
+    
     return m_controllerModelsLoaded;
 }
 
@@ -3870,6 +3925,13 @@ void VRCompositor::CleanupControllerResources() {
     
     Logger::info("VRCompositor: Cleaning up controller model resources...");
     
+    // Cleanup laser pointer
+    if (m_laserPointer) {
+        m_laserPointer->Shutdown();
+        m_laserPointer.reset();
+    }
+    m_laserInitialized = false;
+    
     // Cleanup controller model manager
     if (m_controllerModelManager) {
         m_controllerModelManager->Shutdown();
@@ -4347,6 +4409,170 @@ bool VRCompositor::UploadControllerTextures() {
     
     m_controllerTexturesUploaded = true;
     Logger::info("VRCompositor: Controller textures uploaded successfully");
+    return true;
+}
+
+bool VRCompositor::InitializeLaserPointer() {
+    if (m_laserInitialized) return true;
+    if (m_compositorDevice == VK_NULL_HANDLE || !m_pOpenXRManager) return false;
+    
+    Logger::info("VRCompositor: Initializing laser pointer...");
+    
+    m_laserPointer = std::make_unique<VRLaserPointer>();
+    if (!m_laserPointer->Initialize(m_pOpenXRManager, m_compositorDevice, m_cachedPhysicalDevice)) {
+        Logger::err("VRCompositor: Failed to initialize laser pointer");
+        m_laserPointer.reset();
+        return false;
+    }
+    
+    // Create laser resources (uses same descriptor set layout as controllers)
+    if (!m_laserPointer->CreateResources(m_controllerDescriptorSetLayout, 
+                                         m_controllerDescriptorPool,
+                                         m_controllerTextureSampler)) {
+        Logger::err("VRCompositor: Failed to create laser resources");
+        m_laserPointer.reset();
+        return false;
+    }
+    
+    m_laserInitialized = true;
+    Logger::info("VRCompositor: Laser pointer initialized successfully");
+    return true;
+}
+
+void VRCompositor::SetLaserActiveHand(bool isLeftHand) {
+    if (m_laserPointer) {
+        m_laserPointer->SetActiveHand(isLeftHand);
+    }
+}
+
+bool VRCompositor::IsLaserLeftHandActive() const {
+    if (m_laserPointer) {
+        return m_laserPointer->IsLeftHandActive();
+    }
+    return false;  // Default to right hand
+}
+
+void VRCompositor::SetControllerAimPose(bool isLeftHand, const XrPosef& pose) {
+    std::lock_guard<std::mutex> lock(m_aimSpaceMutex);
+    auto now = std::chrono::steady_clock::now();
+    if (isLeftHand) {
+        m_leftAimPose = pose;
+        m_leftAimPoseValid = true;
+        m_leftAimPoseTime = now;
+    } else {
+        m_rightAimPose = pose;
+        m_rightAimPoseValid = true;
+        m_rightAimPoseTime = now;
+    }
+}
+
+bool VRCompositor::GetControllerAimPose(bool isLeftHand, XrPosef& pose) const {
+    std::lock_guard<std::mutex> lock(m_aimSpaceMutex);
+    auto now = std::chrono::steady_clock::now();
+    
+    if (isLeftHand) {
+        if (m_leftAimPoseValid) {
+            // Check if pose is stale (game might be frozen during loading)
+            auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_leftAimPoseTime).count();
+            if (ageMs > AIM_POSE_STALE_MS) {
+                return false;  // Stale, use fallback
+            }
+            pose = m_leftAimPose;
+            return true;
+        }
+    } else {
+        if (m_rightAimPoseValid) {
+            auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_rightAimPoseTime).count();
+            if (ageMs > AIM_POSE_STALE_MS) {
+                return false;  // Stale, use fallback
+            }
+            pose = m_rightAimPose;
+            return true;
+        }
+    }
+    return false;
+}
+
+void VRCompositor::SetAimSpaces(XrSpace leftAimSpace, XrSpace rightAimSpace) {
+    std::lock_guard<std::mutex> lock(m_aimSpaceMutex);
+    m_leftAimSpace = leftAimSpace;
+    m_rightAimSpace = rightAimSpace;
+    Logger::info("VRCompositor: Aim spaces set for direct sampling");
+}
+
+bool VRCompositor::SampleAimPose(bool isLeftHand, XrTime displayTime, XrPosef& pose) const {
+    std::lock_guard<std::mutex> lock(m_aimSpaceMutex);
+    
+    XrSpace aimSpace = isLeftHand ? m_leftAimSpace : m_rightAimSpace;
+    if (aimSpace == XR_NULL_HANDLE || !m_pOpenXRManager) {
+        return false;
+    }
+    
+    XrSpaceLocation location = {XR_TYPE_SPACE_LOCATION};
+    XrResult result = xrLocateSpace(aimSpace, m_pOpenXRManager->GetReferenceSpace(), displayTime, &location);
+    
+    if (XR_SUCCEEDED(result) && (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+        pose = location.pose;
+        return true;
+    }
+    
+    return false;
+}
+
+void VRCompositor::SetLaserColor(float r, float g, float b) {
+    if (m_laserPointer) {
+        m_laserPointer->SetColor(r, g, b);
+    }
+}
+
+void VRCompositor::SetLaserLength(float lengthMeters) {
+    if (m_laserPointer) {
+        m_laserPointer->SetLength(lengthMeters);
+    }
+}
+
+void VRCompositor::SetLaserWidth(float widthMeters) {
+    if (m_laserPointer) {
+        m_laserPointer->SetWidth(widthMeters);
+    }
+}
+
+void VRCompositor::SetLaserIntersectionLength(float lengthMeters) {
+    if (m_laserPointer) {
+        m_laserPointer->SetIntersectionLength(lengthMeters);
+    }
+}
+
+bool VRCompositor::GetQuadCorners(float* corner0, float* corner1, float* corner2, float* corner3) const {
+    // Check if we have valid quad vertices by checking if the quad has any size
+    // m_quadVertices layout: [0]=LL, [1]=LR, [2]=UR, [3]=UL
+    // A valid quad should have non-zero distance between corners
+    float dx = m_quadVertices[1].position[0] - m_quadVertices[0].position[0];
+    float dy = m_quadVertices[1].position[1] - m_quadVertices[0].position[1];
+    float dz = m_quadVertices[1].position[2] - m_quadVertices[0].position[2];
+    float edgeLen = dx*dx + dy*dy + dz*dz;
+    
+    if (edgeLen < 0.0001f) {
+        return false;  // Quad not initialized or degenerate
+    }
+    
+    // Copy corners (LL, LR, UR, UL order)
+    corner0[0] = m_quadVertices[0].position[0];
+    corner0[1] = m_quadVertices[0].position[1];
+    corner0[2] = m_quadVertices[0].position[2];
+    
+    corner1[0] = m_quadVertices[1].position[0];
+    corner1[1] = m_quadVertices[1].position[1];
+    corner1[2] = m_quadVertices[1].position[2];
+    
+    corner2[0] = m_quadVertices[2].position[0];
+    corner2[1] = m_quadVertices[2].position[1];
+    corner2[2] = m_quadVertices[2].position[2];
+    
+    corner3[0] = m_quadVertices[3].position[0];
+    corner3[1] = m_quadVertices[3].position[1];
+    corner3[2] = m_quadVertices[3].position[2];
+    
     return true;
 }
 

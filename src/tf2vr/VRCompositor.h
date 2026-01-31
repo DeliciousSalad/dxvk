@@ -19,6 +19,7 @@
 #include "openxr/openxr_platform.h"
 
 #include "VRControllerModel.h"
+#include "VRLaserPointer.h"
 
 // Forward declarations
 class OpenXRDirectMode;
@@ -197,6 +198,24 @@ private:
     
     bool m_controllerPipelineCreated = false;
     
+    // Laser pointer
+    std::unique_ptr<VRLaserPointer> m_laserPointer;
+    bool m_laserInitialized = false;
+    
+    // Aim spaces from game-side (for direct sampling)
+    mutable std::mutex m_aimSpaceMutex;
+    XrSpace m_leftAimSpace = XR_NULL_HANDLE;
+    XrSpace m_rightAimSpace = XR_NULL_HANDLE;
+    
+    // Fallback: cached aim poses from game (deprecated, used if spaces not available)
+    XrPosef m_leftAimPose = {{0, 0, 0, 1}, {0, 0, 0}};
+    XrPosef m_rightAimPose = {{0, 0, 0, 1}, {0, 0, 0}};
+    bool m_leftAimPoseValid = false;
+    bool m_rightAimPoseValid = false;
+    std::chrono::steady_clock::time_point m_leftAimPoseTime;
+    std::chrono::steady_clock::time_point m_rightAimPoseTime;
+    static constexpr int64_t AIM_POSE_STALE_MS = 100;  // Consider stale after 100ms
+    
     // Frame submission data
     struct FrameData {
         void* textureHandle = nullptr;
@@ -247,6 +266,19 @@ public:
     // Controller model rendering
     bool InitializeControllerModels();
     bool AreControllerModelsLoaded() const { return m_controllerModelsLoaded; }
+    
+    // Laser pointer control
+    void SetLaserActiveHand(bool isLeftHand);
+    bool IsLaserLeftHandActive() const;
+    void SetControllerAimPose(bool isLeftHand, const XrPosef& pose);  // Deprecated, kept for compatibility
+    bool GetControllerAimPose(bool isLeftHand, XrPosef& pose) const;
+    void SetAimSpaces(XrSpace leftAimSpace, XrSpace rightAimSpace);
+    bool SampleAimPose(bool isLeftHand, XrTime displayTime, XrPosef& pose) const;
+    void SetLaserColor(float r, float g, float b);
+    void SetLaserLength(float lengthMeters);
+    void SetLaserWidth(float widthMeters);
+    void SetLaserIntersectionLength(float lengthMeters);  // Set actual length after intersection
+    bool GetQuadCorners(float* corner0, float* corner1, float* corner2, float* corner3) const;  // Get menu quad corners for intersection
 
 private:
     // Frame state for input synchronization
@@ -335,6 +367,9 @@ private:
     void RenderSingleControllerModel(VkCommandBuffer cmdBuffer, const ControllerModel* model, 
                                       const float* viewProjMatrix, XrTime displayTime);
     void ComputeControllerMVP(const ControllerModel* model, int eye, XrTime displayTime, float* mvpOut);
+    
+    // Laser pointer
+    bool InitializeLaserPointer();
 };
 
 } // namespace dxvk

@@ -252,6 +252,9 @@ private:
 	bool m_renderModelExtensionsLoaded = false;
 
 public:
+	// Public accessor for VRCompositor
+	dxvk::VRCompositor* GetVRCompositor() const { return m_vrCompositor.get(); }
+	
 	// Public accessors for render model functions (used by VRCompositor)
 	bool HasRenderModelSupport() const { return m_renderModelExtensionsLoaded; }
 	PFN_xrEnumerateInteractionRenderModelIdsEXT GetEnumerateInteractionRenderModelIdsEXT() const { return m_pfnEnumerateInteractionRenderModelIdsEXT; }

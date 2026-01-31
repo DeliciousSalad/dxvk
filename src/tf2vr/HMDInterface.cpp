@@ -94,3 +94,80 @@ extern "C" void __declspec(dllexport) dxvkSetRenderTextureSize(uint32_t width, u
 	g_pHMDInterface->SetRenderTextureSize(width, height, msaa);
 }
 
+extern "C" void __declspec(dllexport) dxvkSetLaserActiveHand(bool isLeftHand)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor) {
+			compositor->SetLaserActiveHand(isLeftHand);
+		}
+	}
+}
+
+extern "C" void __declspec(dllexport) dxvkSetControllerAimPose(bool isLeftHand, const XrPosef* pose)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor && pose) {
+			compositor->SetControllerAimPose(isLeftHand, *pose);
+		}
+	}
+}
+
+extern "C" void __declspec(dllexport) dxvkSetLaserColor(float r, float g, float b)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor) {
+			compositor->SetLaserColor(r, g, b);
+		}
+	}
+}
+
+extern "C" void __declspec(dllexport) dxvkSetLaserLength(float lengthMeters)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor) {
+			compositor->SetLaserLength(lengthMeters);
+		}
+	}
+}
+
+extern "C" void __declspec(dllexport) dxvkSetLaserWidth(float widthMeters)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor) {
+			compositor->SetLaserWidth(widthMeters);
+		}
+	}
+}
+
+extern "C" void __declspec(dllexport) dxvkSetAimSpaces(XrSpace leftAimSpace, XrSpace rightAimSpace)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor) {
+			compositor->SetAimSpaces(leftAimSpace, rightAimSpace);
+		}
+	}
+}
+
+extern "C" void __declspec(dllexport) dxvkSetLaserIntersectionLength(float lengthMeters)
+{
+	auto* openxr = static_cast<OpenXRDirectMode*>(g_pHMDInterface);
+	if (openxr) {
+		auto* compositor = openxr->GetVRCompositor();
+		if (compositor) {
+			compositor->SetLaserIntersectionLength(lengthMeters);
+		}
+	}
+}
+
