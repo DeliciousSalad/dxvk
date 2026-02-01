@@ -93,7 +93,7 @@ private:
     // Color: R=128, G=183, B=24 → (0.502, 0.718, 0.094)
     std::array<float, 4> m_color = {0.502f, 0.718f, 0.094f, 1.0f};
     float m_length = 2.54f;   // 100 game units ≈ 2.54 meters
-    float m_width = 0.003f;   // Width in meters (~3mm, visible)
+    float m_width = 0.00254f; // 0.1 game units / 39.3701 ≈ 2.54mm
     float m_originOffset = 0.08f;  // Offset forward from grip to approximate aim point (8cm)
     float m_intersectionLength = -1.0f;  // Override length (-1 = use default)
     std::chrono::steady_clock::time_point m_intersectionLengthTime;

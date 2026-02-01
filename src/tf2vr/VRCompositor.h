@@ -202,6 +202,14 @@ private:
     std::unique_ptr<VRLaserPointer> m_laserPointer;
     bool m_laserInitialized = false;
     
+    // Cached laser settings (applied when laser pointer is initialized)
+    // These store values from game-side before the laser pointer is created
+    float m_pendingLaserColor[3] = {0.502f, 0.718f, 0.094f};  // Default: R=128, G=183, B=24
+    float m_pendingLaserLength = 2.54f;   // Default: 100 game units in meters
+    float m_pendingLaserWidth = 0.00254f; // Default: 0.1 game units in meters
+    bool m_pendingLaserActiveHandIsLeft = false;
+    bool m_hasPendingLaserSettings = false;
+    
     // Aim spaces from game-side (for direct sampling)
     mutable std::mutex m_aimSpaceMutex;
     XrSpace m_leftAimSpace = XR_NULL_HANDLE;

@@ -4434,12 +4434,25 @@ bool VRCompositor::InitializeLaserPointer() {
         return false;
     }
     
+    // Apply any cached settings from game-side that were set before initialization
+    if (m_hasPendingLaserSettings) {
+        m_laserPointer->SetColor(m_pendingLaserColor[0], m_pendingLaserColor[1], m_pendingLaserColor[2]);
+        m_laserPointer->SetLength(m_pendingLaserLength);
+        m_laserPointer->SetWidth(m_pendingLaserWidth);
+        m_laserPointer->SetActiveHand(m_pendingLaserActiveHandIsLeft);
+        Logger::info("VRCompositor: Applied cached laser settings from game-side");
+    }
+    
     m_laserInitialized = true;
     Logger::info("VRCompositor: Laser pointer initialized successfully");
     return true;
 }
 
 void VRCompositor::SetLaserActiveHand(bool isLeftHand) {
+    // Cache value for when laser pointer is initialized
+    m_pendingLaserActiveHandIsLeft = isLeftHand;
+    m_hasPendingLaserSettings = true;
+    
     if (m_laserPointer) {
         m_laserPointer->SetActiveHand(isLeftHand);
     }
@@ -4520,18 +4533,32 @@ bool VRCompositor::SampleAimPose(bool isLeftHand, XrTime displayTime, XrPosef& p
 }
 
 void VRCompositor::SetLaserColor(float r, float g, float b) {
+    // Cache values for when laser pointer is initialized
+    m_pendingLaserColor[0] = r;
+    m_pendingLaserColor[1] = g;
+    m_pendingLaserColor[2] = b;
+    m_hasPendingLaserSettings = true;
+    
     if (m_laserPointer) {
         m_laserPointer->SetColor(r, g, b);
     }
 }
 
 void VRCompositor::SetLaserLength(float lengthMeters) {
+    // Cache value for when laser pointer is initialized
+    m_pendingLaserLength = lengthMeters;
+    m_hasPendingLaserSettings = true;
+    
     if (m_laserPointer) {
         m_laserPointer->SetLength(lengthMeters);
     }
 }
 
 void VRCompositor::SetLaserWidth(float widthMeters) {
+    // Cache value for when laser pointer is initialized
+    m_pendingLaserWidth = widthMeters;
+    m_hasPendingLaserSettings = true;
+    
     if (m_laserPointer) {
         m_laserPointer->SetWidth(widthMeters);
     }
