@@ -120,6 +120,12 @@ public:
 	VkPhysicalDevice GetVulkanPhysicalDevice() const { return m_vkPhysicalDevice; }
 	VkInstance GetVulkanInstance() const { return m_vkInstance; }
 	
+	// Queue locking for thread-safe submissions from compositor thread
+	// These use DXVK's submission queue synchronization to prevent
+	// concurrent VkQueue access between DXVK and the compositor.
+	void LockDeviceQueue();
+	void UnlockDeviceQueue();
+	
 	// Session focus (set by game when overlay opens/closes)
 	void SetSessionFocused(bool focused) { m_sessionFocused = focused; }
 	bool IsSessionFocused() const { return m_sessionFocused; }
@@ -165,6 +171,9 @@ private:
 	VkQueue m_vkQueue = VK_NULL_HANDLE;
 	uint32_t m_vkQueueFamilyIndex = 0;
 	VkCommandPool m_currentCommandPool = VK_NULL_HANDLE;
+	
+	// DXVK device reference for queue locking (set in OnRenderTargetChanged)
+	dxvk::Rc<dxvk::DxvkDevice> m_dxvkDevice;
 
 	std::chrono::high_resolution_clock::time_point m_tStartTime;
 	std::chrono::high_resolution_clock::time_point m_tEndTime;

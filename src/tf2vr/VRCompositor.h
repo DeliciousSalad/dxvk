@@ -67,11 +67,13 @@ private:
     std::vector<XrSwapchainImageVulkan2KHR> m_compositorSwapchainImages[2];
     bool m_compositorSwapchainsCreated = false;
     
-    // Compositor's own Vulkan resources (completely independent device)
+    // Compositor's Vulkan resources (shares session's VkDevice - do NOT destroy device)
     VkDevice m_compositorDevice = VK_NULL_HANDLE;
     VkQueue m_compositorQueue = VK_NULL_HANDLE;
     uint32_t m_compositorQueueFamily = 0;
     VkCommandPool m_compositorCommandPool = VK_NULL_HANDLE;
+    bool m_ownsDevice = false; // If true, destructor destroys the device (legacy). If false, device is shared.
+    std::mutex m_queueSubmitMutex; // Protects vkQueueSubmit when sharing queue with main pipeline
     
     // Stored menu texture (our own copy to avoid race conditions)
     VkImage m_storedMenuTexture = VK_NULL_HANDLE;

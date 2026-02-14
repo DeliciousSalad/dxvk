@@ -170,4 +170,3 @@ extern "C" void __declspec(dllexport) dxvkSetLaserIntersectionLength(float lengt
 		}
 	}
 }
-

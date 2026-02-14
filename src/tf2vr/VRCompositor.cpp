@@ -42,8 +42,10 @@ void VRCompositor::CleanupVulkanResources() {
     
     Logger::info("VRCompositor: Cleaning up Vulkan resources");
     
-    // Wait for device to be idle
-    vkDeviceWaitIdle(m_compositorDevice);
+    // Wait for our compositor fence to complete (don't stall the entire shared device)
+    if (m_compositorFence != VK_NULL_HANDLE) {
+        vkWaitForFences(m_compositorDevice, 1, &m_compositorFence, VK_TRUE, 1000000000); // 1s timeout
+    }
     
     // Cleanup OpenXR swapchains
     for (int eye = 0; eye < 2; eye++) {
@@ -190,12 +192,16 @@ void VRCompositor::CleanupVulkanResources() {
     // Cleanup controller model resources
     CleanupControllerResources();
     
-    // Finally destroy the device
-    if (m_compositorDevice != VK_NULL_HANDLE) {
+    // Only destroy the device if we created it (legacy independent device mode)
+    // When using the shared session device, we must NOT destroy it
+    if (m_ownsDevice && m_compositorDevice != VK_NULL_HANDLE) {
+        Logger::info("VRCompositor: Destroying owned Vulkan device");
         vkDestroyDevice(m_compositorDevice, nullptr);
-        m_compositorDevice = VK_NULL_HANDLE;
-        m_compositorQueue = VK_NULL_HANDLE; // Queue is destroyed with device
+    } else if (m_compositorDevice != VK_NULL_HANDLE) {
+        Logger::info("VRCompositor: Releasing shared Vulkan device reference (NOT destroying)");
     }
+    m_compositorDevice = VK_NULL_HANDLE;
+    m_compositorQueue = VK_NULL_HANDLE;
     
     Logger::info("VRCompositor: ✅ Vulkan resources cleaned up");
 }
@@ -241,31 +247,24 @@ bool VRCompositor::Initialize() {
         return false;
     }
     
-    Logger::info("VRCompositor: Creating independent Vulkan device...");
+    Logger::info("VRCompositor: Setting up Vulkan device (shared with session)...");
     if (!CreateIndependentVulkanDevice()) {
-        Logger::err("VRCompositor: Failed to create independent Vulkan device");
+        Logger::err("VRCompositor: Failed to set up Vulkan device");
         return false;
     }
-    Logger::info("VRCompositor: ✅ Independent Vulkan device created");
+    Logger::info("VRCompositor: ✅ Vulkan device ready (shared with OpenXR session)");
     
-    Logger::info("VRCompositor: Creating compositor swapchains...");
     if (!CreateCompositorSwapchains()) {
         Logger::err("VRCompositor: Failed to create compositor swapchains");
         return false;
     }
     Logger::info("VRCompositor: ✅ Compositor swapchains created");
     
-    Logger::info("VRCompositor: Creating simple 3D quad rendering...");
     if (!CreateSimple3DQuad()) {
         Logger::warn("VRCompositor: Failed to create 3D quad, falling back to clear rendering");
-        // Fall back to clear rendering if 3D fails
     }
-    Logger::info("VRCompositor: ✅ Vulkan rendering pipeline created");
-    
-    Logger::info(str::format("VRCompositor: Swapchains created flag: ", m_compositorSwapchainsCreated));
     
     // Initialize controller model rendering (optional - will log if not available)
-    Logger::info("VRCompositor: Initializing controller models...");
     if (InitializeControllerModels()) {
         Logger::info("VRCompositor: ✅ Controller models initialized");
     } else {
@@ -340,6 +339,12 @@ bool VRCompositor::RenderFrame(const XrFrameState& frameState, std::vector<XrCom
         return false;
     }
     
+    // Track which eyes successfully acquired swapchain images
+    // CRITICAL: Only release swapchains that were actually acquired to avoid
+    // XR_ERROR_CALL_ORDER_INVALID cascades that permanently corrupt state
+    bool eyeAcquired[2] = {false, false};
+    bool anyEyeRendered = false;
+    
     // Reset the fence for this frame's GPU work tracking
     // The fence should be signaled from the previous frame's wait
     VkResult result = vkResetFences(m_compositorDevice, 1, &m_compositorFence);
@@ -370,52 +375,75 @@ bool VRCompositor::RenderFrame(const XrFrameState& frameState, std::vector<XrCom
         return false;
     }
     
-    // Render to both eyes
+    // Render to both eyes - RenderEye handles acquire+wait internally
     for (int eye = 0; eye < 2; eye++) {
         if (!RenderEye(eye, frameState)) {
-            Logger::warn(str::format("VRCompositor: Failed to render eye ", eye));
+            // Log at reduced frequency to avoid log spam during persistent failures
+            static int failCount[2] = {0, 0};
+            failCount[eye]++;
+            if (failCount[eye] <= 3 || failCount[eye] % 300 == 0) {
+                Logger::warn(str::format("VRCompositor: Failed to render eye ", eye, 
+                    " (failure #", failCount[eye], ")"));
+            }
             continue;
         }
+        eyeAcquired[eye] = true;
+        anyEyeRendered = true;
     }
     
-    // End command buffer
+    // End command buffer (must end even if empty, since we called begin)
     result = vkEndCommandBuffer(m_compositorCommandBuffer);
     if (result != VK_SUCCESS) {
         Logger::warn("VRCompositor: Failed to end command buffer");
-        return false;
+        // Still need to release any acquired swapchain images
+        goto release_swapchains;
     }
     
-    // Submit commands
-    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_compositorCommandBuffer;
-    
-    result = vkQueueSubmit(m_compositorQueue, 1, &submitInfo, m_compositorFence);
-    if (result != VK_SUCCESS) {
-        Logger::warn(str::format("VRCompositor: Failed to submit commands - error: ", static_cast<int>(result)));
-        return false;
+    // Only submit GPU work if at least one eye rendered successfully
+    if (anyEyeRendered) {
+        VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &m_compositorCommandBuffer;
+        
+        // Lock DXVK's device queue for thread-safe submission
+        if (m_pOpenXRManager) {
+            m_pOpenXRManager->LockDeviceQueue();
+        }
+        result = vkQueueSubmit(m_compositorQueue, 1, &submitInfo, m_compositorFence);
+        if (m_pOpenXRManager) {
+            m_pOpenXRManager->UnlockDeviceQueue();
+        }
+        if (result != VK_SUCCESS) {
+            Logger::warn(str::format("VRCompositor: vkQueueSubmit failed - error: ", static_cast<int>(result)));
+            goto release_swapchains;
+        }
+        
+        // CRITICAL: Wait for GPU work to complete BEFORE releasing swapchain images
+        result = vkWaitForFences(m_compositorDevice, 1, &m_compositorFence, VK_TRUE, 10000000); // 10ms timeout
+        if (result == VK_TIMEOUT) {
+            Logger::warn("VRCompositor: GPU work timeout before swapchain release");
+        } else if (result != VK_SUCCESS) {
+            Logger::warn(str::format("VRCompositor: Fence wait failed: ", static_cast<int>(result)));
+        }
     }
     
-    // CRITICAL: Wait for GPU work to complete BEFORE releasing swapchain images
-    // Some OpenXR runtimes (non-SteamVR) may not handle async GPU work properly
-    // and expect the images to be fully rendered when released.
-    // This adds ~1-2ms latency but ensures consistent behavior across runtimes.
-    result = vkWaitForFences(m_compositorDevice, 1, &m_compositorFence, VK_TRUE, 10000000); // 10ms timeout
-    if (result == VK_TIMEOUT) {
-        Logger::warn("VRCompositor: GPU work timeout before swapchain release");
-    } else if (result != VK_SUCCESS) {
-        Logger::warn(str::format("VRCompositor: Fence wait failed: ", static_cast<int>(result)));
-    }
-    
-    // Release swapchain images AFTER GPU work is complete
+release_swapchains:
+    // Release ONLY swapchain images that were actually acquired
+    // Releasing a non-acquired image causes XR_ERROR_CALL_ORDER_INVALID and
+    // corrupts the swapchain state machine, making ALL future frames fail
     for (int eye = 0; eye < 2; eye++) {
-        if (m_compositorSwapchains[eye] != XR_NULL_HANDLE) {
+        if (eyeAcquired[eye] && m_compositorSwapchains[eye] != XR_NULL_HANDLE) {
             XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             XrResult xrResult = xrReleaseSwapchainImage(m_compositorSwapchains[eye], &releaseInfo);
             if (XR_FAILED(xrResult)) {
                 Logger::warn(str::format("VRCompositor: Failed to release swapchain image for eye ", eye, " - error: ", static_cast<int>(xrResult)));
             }
         }
+    }
+    
+    // If no eyes rendered, don't create a layer - return false to submit empty frame
+    if (!anyEyeRendered) {
+        return false;
     }
     
     // Create OpenXR layer
@@ -639,12 +667,18 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
         return false;
     }
     
-    // Submit the copy command with fence
+    // Submit the copy command with fence (lock DXVK's queue)
     VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmdBuffer;
     
+    if (m_pOpenXRManager) {
+        m_pOpenXRManager->LockDeviceQueue();
+    }
     result = vkQueueSubmit(m_compositorQueue, 1, &submitInfo, copyFence);
+    if (m_pOpenXRManager) {
+        m_pOpenXRManager->UnlockDeviceQueue();
+    }
     if (result != VK_SUCCESS) {
         Logger::err(str::format("VRCompositor: Failed to submit copy command - error: ", result));
         vkDestroyFence(m_compositorDevice, copyFence, nullptr);
@@ -697,61 +731,34 @@ bool VRCompositor::CreateIndependentVulkanDevice() {
         return false;
     }
     
-    // Use cached Vulkan objects
-    VkPhysicalDevice physicalDevice = m_cachedPhysicalDevice;
-    VkInstance instance = m_cachedInstance;
+    // CRITICAL: Use the session's VkDevice instead of creating an independent one.
+    // OpenXR swapchain images are allocated on the session's device. Rendering to them
+    // from a different VkDevice is invalid Vulkan usage and causes VK_ERROR_DEVICE_LOST
+    // on runtimes that validate device ownership (e.g. Virtual Desktop with foveated streaming).
+    m_compositorDevice = m_pOpenXRManager->GetVulkanDevice();
+    m_compositorQueue = m_pOpenXRManager->GetVulkanQueue();
+    m_compositorQueueFamily = m_pOpenXRManager->GetGraphicsQueueFamily();
+    m_ownsDevice = false; // Shared device - do NOT destroy in cleanup
     
-    if (physicalDevice == VK_NULL_HANDLE || instance == VK_NULL_HANDLE) {
-        Logger::err("VRCompositor: No valid cached Vulkan physical device or instance - call CacheOpenXRData first");
+    if (m_compositorDevice == VK_NULL_HANDLE) {
+        Logger::err("VRCompositor: Session's Vulkan device not available - ensure StoreSharedTexture was called");
         return false;
     }
     
-    // Find graphics queue family
-    uint32_t queueFamilyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
-    
-    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies.data());
-    
-    m_compositorQueueFamily = UINT32_MAX;
-    for (uint32_t i = 0; i < queueFamilyCount; i++) {
-        if (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            m_compositorQueueFamily = i;
-            break;
-        }
-    }
-    
-    if (m_compositorQueueFamily == UINT32_MAX) {
-        Logger::err("VRCompositor: No graphics queue family found");
+    if (m_compositorQueue == VK_NULL_HANDLE) {
+        Logger::err("VRCompositor: Session's Vulkan queue not available - ensure queue was set before init");
         return false;
     }
     
-    // Create independent logical device
-    float queuePriority = 1.0f;
-    VkDeviceQueueCreateInfo queueCreateInfo = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
-    queueCreateInfo.queueFamilyIndex = m_compositorQueueFamily;
-    queueCreateInfo.queueCount = 1;
-    queueCreateInfo.pQueuePriorities = &queuePriority;
+    Logger::info(str::format("VRCompositor: Using session's shared VkDevice: ", (void*)m_compositorDevice,
+        " VkQueue: ", (void*)m_compositorQueue, " queueFamily: ", m_compositorQueueFamily));
     
-    VkDeviceCreateInfo deviceCreateInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    deviceCreateInfo.queueCreateInfoCount = 1;
-    deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
-    
-    VkResult result = vkCreateDevice(physicalDevice, &deviceCreateInfo, nullptr, &m_compositorDevice);
-    if (result != VK_SUCCESS) {
-        Logger::err(str::format("VRCompositor: Failed to create device - error: ", static_cast<int>(result)));
-        return false;
-    }
-    
-    // Get queue from our device
-    vkGetDeviceQueue(m_compositorDevice, m_compositorQueueFamily, 0, &m_compositorQueue);
-    
-    // Create command pool
+    // Create our own command pool on the shared device
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = m_compositorQueueFamily;
     
-    result = vkCreateCommandPool(m_compositorDevice, &poolInfo, nullptr, &m_compositorCommandPool);
+    VkResult result = vkCreateCommandPool(m_compositorDevice, &poolInfo, nullptr, &m_compositorCommandPool);
     if (result != VK_SUCCESS) {
         Logger::err(str::format("VRCompositor: Failed to create command pool - error: ", static_cast<int>(result)));
         return false;
@@ -779,7 +786,7 @@ bool VRCompositor::CreateIndependentVulkanDevice() {
         return false;
     }
     
-    Logger::info("VRCompositor: ✅ Independent Vulkan device created successfully");
+    Logger::info("VRCompositor: ✅ Using shared Vulkan device successfully (command pool + fence created)");
     return true;
 }
 
@@ -1385,7 +1392,24 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
     uint32_t imageIndex;
     XrResult result = xrAcquireSwapchainImage(m_compositorSwapchains[eye], &acquireInfo, &imageIndex);
     if (XR_FAILED(result)) {
-        Logger::warn(str::format("VRCompositor: Failed to acquire swapchain image for eye ", eye, " - error: ", static_cast<int>(result)));
+        // Detailed diagnostic for swapchain acquire failures
+        static int acquireFailCount[2] = {0, 0};
+        acquireFailCount[eye]++;
+        const char* errorName = (result == -37) ? "XR_ERROR_CALL_ORDER_INVALID" :
+                                (result == -12) ? "XR_ERROR_INSTANCE_LOST" :
+                                (result == -3)  ? "XR_ERROR_RUNTIME_FAILURE" : "unknown";
+        // Log first few failures in detail, then reduce frequency
+        if (acquireFailCount[eye] <= 5 || acquireFailCount[eye] % 300 == 0) {
+            Logger::warn(str::format("VRCompositor: Failed to acquire swapchain image for eye ", eye,
+                " - error: ", static_cast<int>(result), " (", errorName, ")",
+                " swapchain=", (void*)m_compositorSwapchains[eye],
+                " failure #", acquireFailCount[eye]));
+            if (result == -37) {
+                Logger::warn("VRCompositor: XR_ERROR_CALL_ORDER_INVALID likely means: "
+                    "swapchain image already acquired (not released from previous frame), "
+                    "or session not in correct state. Check runtime logs.");
+            }
+        }
         return false;
     }
     
@@ -1432,7 +1456,6 @@ bool VRCompositor::RenderEye(int eye, const XrFrameState& frameState) {
         clearColor.float32[3] = 1.0f;  // A
     }
     
-    // If we have a 3D quad, render it using the proper pipeline
     if (m_has3DQuad) {
         // Render using proper Vulkan render pass - no manual layout transitions needed
         // The render pass handles layout transitions automatically
@@ -1648,7 +1671,7 @@ void VRCompositor::CheckAndUpdateHUDPosition() {
 }
 
 void VRCompositor::CompositorThreadFunc() {
-    Logger::info("VRCompositor: 🧵 Compositor thread started");
+    Logger::info("VRCompositor: Compositor thread started");
     
     while (!m_shouldStop.load()) {
         // NOTE: Texture copying now happens inside RunIndependentFrame after xrBeginFrame
@@ -2013,10 +2036,17 @@ void VRCompositor::SetupMVPMatrix() {
 
 bool VRCompositor::RunIndependentFrame() {
     static int frameCount = 0;
+    static int consecutiveFailures = 0;
     frameCount++;
     
     if (frameCount == 1) {
         Logger::info("VRCompositor: 🧵 First RunIndependentFrame called - thread is running!");
+        Logger::info(str::format("VRCompositor: 📊 Diagnostic info: session=", (void*)m_cachedSession,
+            " physDevice=", (void*)m_cachedPhysicalDevice,
+            " compositorDevice=", (void*)m_compositorDevice,
+            " swapchain[0]=", (void*)m_compositorSwapchains[0],
+            " swapchain[1]=", (void*)m_compositorSwapchains[1],
+            " resolution=", m_cachedRenderWidth, "x", m_cachedRenderHeight));
     }
     
     // SIMPLE APPROACH: No complex synchronization - let systems run independently
@@ -2051,7 +2081,10 @@ bool VRCompositor::RunIndependentFrame() {
     
     XrResult result = xrWaitFrame(m_cachedSession, &frameWaitInfo, &frameState);
     if (XR_FAILED(result)) {
-        Logger::warn(str::format("VRCompositor: Independent xrWaitFrame failed - error: ", static_cast<int>(result)));
+        Logger::warn(str::format("VRCompositor: Independent xrWaitFrame failed - error: ", static_cast<int>(result),
+            " (XR error name: ", (result == -37 ? "XR_ERROR_CALL_ORDER_INVALID" : 
+                                   result == -4 ? "XR_ERROR_API_VERSION_UNSUPPORTED" :
+                                   result == -3 ? "XR_ERROR_RUNTIME_FAILURE" : "unknown"), ")"));
         return false;
     }
     
@@ -2973,12 +3006,13 @@ bool VRCompositor::CreateSimpleFallbackTexture() {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmdBuffer;
     
+    if (m_pOpenXRManager) m_pOpenXRManager->LockDeviceQueue();
     result = vkQueueSubmit(m_compositorQueue, 1, &submitInfo, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) {
         Logger::err(str::format("VRCompositor: Failed to submit command buffer - error: ", result));
     }
-    
     vkQueueWaitIdle(m_compositorQueue);
+    if (m_pOpenXRManager) m_pOpenXRManager->UnlockDeviceQueue();
     
     // Clean up staging resources
     vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
@@ -3265,8 +3299,10 @@ bool VRCompositor::CreateMaskTextureFromPNG(const unsigned char* pngData, int wi
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
     
+    if (m_pOpenXRManager) m_pOpenXRManager->LockDeviceQueue();
     vkQueueSubmit(m_compositorQueue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_compositorQueue);
+    if (m_pOpenXRManager) m_pOpenXRManager->UnlockDeviceQueue();
     
     // Cleanup staging resources
     vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &commandBuffer);
@@ -3721,8 +3757,10 @@ bool VRCompositor::CreateControllerPipelineLayout() {
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmdBuffer;
+    if (m_pOpenXRManager) m_pOpenXRManager->LockDeviceQueue();
     vkQueueSubmit(m_compositorQueue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_compositorQueue);
+    if (m_pOpenXRManager) m_pOpenXRManager->UnlockDeviceQueue();
     
     vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
     vkDestroyBuffer(m_compositorDevice, stagingBuffer, nullptr);
@@ -4333,8 +4371,10 @@ bool VRCompositor::UploadControllerTextures() {
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &cmdBuffer;
             
+            if (m_pOpenXRManager) m_pOpenXRManager->LockDeviceQueue();
             vkQueueSubmit(m_compositorQueue, 1, &submitInfo, VK_NULL_HANDLE);
             vkQueueWaitIdle(m_compositorQueue);
+            if (m_pOpenXRManager) m_pOpenXRManager->UnlockDeviceQueue();
             
             vkFreeCommandBuffers(m_compositorDevice, m_compositorCommandPool, 1, &cmdBuffer);
             
