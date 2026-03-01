@@ -689,8 +689,7 @@ bool OpenXRDirectMode::EndFrame()
 	viewLocateInfo.space = m_referenceSpace;
 
 	uint32_t viewCount = (uint32_t)m_views.size();
-	//XrResult result = xrLocateViews(m_session, &viewLocateInfo, &m_viewState, viewCount, &viewCount, m_views.data());
-	XrResult result;
+	XrResult result = xrLocateViews(m_session, &viewLocateInfo, &m_viewState, viewCount, &viewCount, m_views.data());
 
 	if (XR_FAILED(result)) 
 	{
@@ -827,7 +826,7 @@ void OpenXRDirectMode::StoreSharedTexture(int index, VulkanTextureData* vulkanDa
 		// This could be an eye texture for VR rendering
 		SharedTextureData sharedTexture;
 		sharedTexture.sourceImage = vulkanData->image;
-		sharedTexture.currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;  // Assume shader read layout initially
+		sharedTexture.currentLayout = VK_IMAGE_LAYOUT_GENERAL;  // DXVK keeps D3D9 textures permanently in GENERAL (see pickLayout())
 		sharedTexture.width = vulkanData->width;
 		sharedTexture.height = vulkanData->height;
 		sharedTexture.format = vulkanData->format;
@@ -1041,6 +1040,24 @@ bool OpenXRDirectMode::CopyToSwapchains()
 		Logger::err("OpenXRDirectMode: Failed to begin command buffer for copy");
 		return false;
 	}
+
+	// Source barrier: ensure DXVK's writes are visible before we read.
+	// Keep layout as GENERAL (DXVK's permanent layout for D3D9 textures).
+	VkImageMemoryBarrier srcBarrier = {};
+	srcBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	srcBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	srcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	srcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	srcBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	srcBarrier.image = srcData.sourceImage;
+	srcBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+	vkCmdPipelineBarrier(cmdBuffer,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &srcBarrier);
 
 	// Acquire, copy, and release for each eye's swapchain
 	bool eyeAcquired[2] = {false, false};
@@ -1269,33 +1286,17 @@ void OpenXRDirectMode::endSingleTimeCommands(VkCommandBuffer commandBuffer) {
     }
     vkResetFences(m_vkDevice, 1, &fence);
 
-    // Set up pipeline stage flags for better pipelining
-    VkPipelineStageFlags waitStages[] = { 
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT 
-    };
-
-    // Use semaphores for GPU-side synchronization
-    VkSemaphore waitSemaphore = m_frameSyncSemaphores[m_currentCommandBufferIndex];
-    VkSemaphore signalSemaphore = m_frameSyncSemaphores[(m_currentCommandBufferIndex + 1) % m_commandBuffers.size()];
-
-    // Submit the command buffer
+    // Submit the command buffer with fence-only synchronization.
+    // Semaphore wait/signal removed: on the first frame the semaphores are unsignaled,
+    // causing a permanent GPU hang on AMD (which strictly enforces semaphore ordering).
+    // The fence wait below is sufficient for correctness.
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
-    
-    // Wait on the previous frame's semaphore if it exists
-    if (m_frameCounter > 0) {
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &waitSemaphore;
-        submitInfo.pWaitDstStageMask = waitStages;
-    }
-    
-    // Signal the next frame's semaphore
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &signalSemaphore;
 
+    // Queue mutex is already held by the DXVK submission thread (which calls
+    // PrePresentCallBack -> EndFrame -> CopyToSwapchains -> here).
     vkResult = vkQueueSubmit(m_vkQueue, 1, &submitInfo, fence);
     if (vkResult != VK_SUCCESS) {
         Logger::err(str::format("OpenXRDirectMode: Failed to submit queue, error: ", vkResult));

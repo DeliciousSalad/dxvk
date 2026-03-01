@@ -576,11 +576,14 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
     
     vkBeginCommandBuffer(cmdBuffer, &beginInfo);
     
-    // CRITICAL: Ensure source texture is fully written and ready for reading
-    // Add a comprehensive barrier that waits for ALL possible write operations to complete
+    // CRITICAL: Memory barrier only - do NOT change the source image's layout.
+    // DXVK keeps D3D9 textures permanently in VK_IMAGE_LAYOUT_GENERAL (see pickLayout()).
+    // Transitioning to TRANSFER_SRC_OPTIMAL without restoring corrupts DXVK's layout tracking,
+    // causing GPU faults on AMD drivers which strictly enforce layout correctness.
+    // GENERAL is a valid srcImageLayout for vkCmdCopyImage.
     VkImageMemoryBarrier srcBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    srcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL; // More permissive - source could be in various states
-    srcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    srcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    srcBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     srcBarrier.image = sourceTexture;
@@ -633,7 +636,7 @@ bool VRCompositor::CopyAndStoreMenuTexture(VkImage sourceTexture, int width, int
     copyRegion.dstOffset = {0, 0, 0};
     copyRegion.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
     
-    vkCmdCopyImage(cmdBuffer, sourceTexture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImage(cmdBuffer, sourceTexture, VK_IMAGE_LAYOUT_GENERAL,
                    m_copiedMenuTexture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
     
     // Transition destination image to shader read only optimal for sampling
@@ -1078,16 +1081,29 @@ bool VRCompositor::CreateVertexBuffer() {
     allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits, 
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     
+    if (allocInfo.memoryTypeIndex == UINT32_MAX) {
+        Logger::err("VRCompositor: No suitable memory type for vertex buffer (HOST_VISIBLE required)");
+        return false;
+    }
+    
     result = vkAllocateMemory(m_compositorDevice, &allocInfo, nullptr, &m_vertexBufferMemory);
     if (result != VK_SUCCESS) {
         Logger::err(str::format("VRCompositor: Failed to allocate vertex buffer memory - error: ", static_cast<int>(result)));
         return false;
     }
     
-    vkBindBufferMemory(m_compositorDevice, m_vertexBuffer, m_vertexBufferMemory, 0);
+    result = vkBindBufferMemory(m_compositorDevice, m_vertexBuffer, m_vertexBufferMemory, 0);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to bind vertex buffer memory - error: ", static_cast<int>(result)));
+        return false;
+    }
     
     void* data;
-    vkMapMemory(m_compositorDevice, m_vertexBufferMemory, 0, bufferSize, 0, &data);
+    result = vkMapMemory(m_compositorDevice, m_vertexBufferMemory, 0, bufferSize, 0, &data);
+    if (result != VK_SUCCESS) {
+        Logger::err(str::format("VRCompositor: Failed to map vertex buffer memory - error: ", static_cast<int>(result)));
+        return false;
+    }
     memcpy(data, quadVertices, (size_t)bufferSize);
     vkUnmapMemory(m_compositorDevice, m_vertexBufferMemory);
     
@@ -1105,8 +1121,20 @@ uint32_t VRCompositor::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags
         }
     }
     
-    Logger::err("VRCompositor: Failed to find suitable memory type!");
-    return 0;
+    // On AMD GPUs, HOST_VISIBLE memory may not satisfy the type filter with full
+    // property flags. Try again with relaxed requirements (just HOST_VISIBLE).
+    if (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+        VkMemoryPropertyFlags relaxed = properties & ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & relaxed) == relaxed) {
+                Logger::warn(str::format("VRCompositor: Using relaxed memory type ", i, " (missing HOST_COHERENT)"));
+                return i;
+            }
+        }
+    }
+    
+    Logger::err(str::format("VRCompositor: Failed to find suitable memory type! filter=", typeFilter, " properties=", properties));
+    return UINT32_MAX;
 }
 
 bool VRCompositor::CreateRenderPass() {
@@ -1681,8 +1709,18 @@ void VRCompositor::CompositorThreadFunc() {
         CheckAndUpdateHUDPosition();
         
         if (!RunIndependentFrame()) {
+            // CRITICAL: Always unblock TF2 on failure to prevent the game from
+            // getting stuck at the 50ms PrePresent timeout on every frame.
+            // Without this, AMD GPUs (or any GPU where the compositor fails to
+            // initialize properly) would appear frozen on the loading screen.
+            {
+                std::lock_guard<std::mutex> lock(m_tf2FrameSignalMutex);
+                m_tf2CanRenderFrame = true;
+            }
+            m_tf2FrameCondition.notify_all();
+            
             Logger::warn("VRCompositor: Independent frame failed, minimal sleep");
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));  // Minimal delay for responsiveness
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     
@@ -3490,9 +3528,9 @@ bool VRCompositor::CreateDepthResources() {
 bool VRCompositor::CreateControllerRenderPass() {
     if (m_compositorDevice == VK_NULL_HANDLE) return false;
     
-    // Color attachment
+    // Color attachment - must match compositor swapchain format (B8G8R8A8_SRGB)
     VkAttachmentDescription colorAttachment = {};
-    colorAttachment.format = VK_FORMAT_R8G8B8A8_SRGB;  // Match swapchain format
+    colorAttachment.format = VK_FORMAT_B8G8R8A8_SRGB;
     colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // Load existing content (menu quad)
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;

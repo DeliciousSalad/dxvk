@@ -2601,6 +2601,7 @@ namespace dxvk {
           break;
 
         case D3DRS_ADAPTIVETESS_Y:
+        case D3DRS_MULTISAMPLEANTIALIAS:
           break;
 
         case D3DRS_ADAPTIVETESS_X:
