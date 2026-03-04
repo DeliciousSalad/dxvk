@@ -102,10 +102,11 @@ namespace dxvk {
   struct DxsoSamplerInfo {
     uint32_t dimensions = 0;
 
-    uint32_t varId = 0;
-    uint32_t typeId = 0;
-
+    uint32_t imageVarId = 0;
     uint32_t imageTypeId = 0;
+
+    uint32_t sampledTypeId = 0u;
+    uint32_t samplerIndex = 0u;
   };
 
   enum DxsoSamplerType : uint32_t {
@@ -247,7 +248,9 @@ namespace dxvk {
     const DxsoDefinedConstants& constants() { return m_constants; }
     uint32_t usedSamplers() const { return m_usedSamplers; }
     uint32_t usedRTs() const { return m_usedRTs; }
-    uint32_t maxDefinedConstant() const { return m_maxDefinedConstant; }
+    int32_t  maxDefinedFloatConstant() const { return m_maxDefinedFloatConstant; }
+    int32_t  maxDefinedIntConstant() const { return m_maxDefinedIntConstant; }
+    int32_t  maxDefinedBoolConstant() const { return m_maxDefinedBoolConstant; }
     uint32_t textureTypes() const { return m_textureTypes; }
 
   private:
@@ -259,7 +262,9 @@ namespace dxvk {
 
     DxsoShaderMetaInfo         m_meta;
     DxsoDefinedConstants       m_constants;
-    uint32_t                   m_maxDefinedConstant = 0u;
+    int32_t                    m_maxDefinedFloatConstant = -1;
+    int32_t                    m_maxDefinedIntConstant = -1;
+    int32_t                    m_maxDefinedBoolConstant = -1;
 
     SpirvModule                m_module;
 
@@ -364,7 +369,13 @@ namespace dxvk {
     uint32_t m_specUbo = 0;
 
     uint32_t m_rsBlock = 0;
+    uint32_t m_rsFirstSampler = 0u;
+
+    uint32_t m_samplerArray = 0u;
+
     uint32_t m_mainFuncLabel = 0;
+
+    DxvkPushDataBlock m_samplerPushData;
 
     //////////////////////////////////////
     // Common function definition methods
@@ -681,7 +692,7 @@ namespace dxvk {
     void emitInputSetup();
 
     void emitVsClipping();
-    void setupRenderStateInfo();
+    void setupRenderStateInfo(uint32_t samplerCount);
     void emitFog();
     void emitPsProcessing();
     void emitOutputDepthClamp();

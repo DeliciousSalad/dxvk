@@ -22,9 +22,18 @@ namespace dxvk {
    */
   struct DxvkMetaBlitPushConstants {
     DxvkMetaBlitOffset srcCoord0;
-    uint32_t           pad1;
     DxvkMetaBlitOffset srcCoord1;
     uint32_t           layerCount;
+    uint32_t           sampler;
+  };
+
+  /**
+   * \brief Resolve mode for multisampled blits
+   */
+  enum class DxvkMetaBlitResolveMode : uint32_t {
+    FilterNearest     = 0u,
+    FilterLinear      = 1u,
+    ResolveAverage    = 2u,
   };
   
   /**
@@ -37,42 +46,29 @@ namespace dxvk {
   struct DxvkMetaBlitPipelineKey {
     VkImageViewType       viewType;
     VkFormat              viewFormat;
-    VkSampleCountFlagBits samples;
+    VkSampleCountFlagBits srcSamples;
+    VkSampleCountFlagBits dstSamples;
+    DxvkMetaBlitResolveMode resolveMode;
     
     bool eq(const DxvkMetaBlitPipelineKey& other) const {
-      return this->viewType   == other.viewType
-          && this->viewFormat == other.viewFormat
-          && this->samples    == other.samples;
+      return this->viewType     == other.viewType
+          && this->viewFormat   == other.viewFormat
+          && this->srcSamples   == other.srcSamples
+          && this->dstSamples   == other.dstSamples
+          && this->resolveMode  == other.resolveMode;
     }
     
     size_t hash() const {
       DxvkHashState result;
       result.add(uint32_t(this->viewType));
       result.add(uint32_t(this->viewFormat));
-      result.add(uint32_t(this->samples));
+      result.add(uint32_t(this->srcSamples));
+      result.add(uint32_t(this->dstSamples));
+      result.add(uint32_t(this->resolveMode));
       return result;
     }
   };
-  
-  /**
-   * \brief Blit render pass key
-   */
-  struct DxvkMetaBlitRenderPassKey {
-    VkFormat              viewFormat;
-    VkSampleCountFlagBits samples;
-    
-    bool eq(const DxvkMetaBlitRenderPassKey& other) const {
-      return this->viewFormat == other.viewFormat
-          && this->samples    == other.samples;
-    }
-    
-    size_t hash() const {
-      DxvkHashState result;
-      result.add(uint32_t(this->viewFormat));
-      result.add(uint32_t(this->samples));
-      return result;
-    }
-  };
+
   
   /**
    * \brief Blit pipeline
@@ -81,9 +77,8 @@ namespace dxvk {
    * that is used for blitting.
    */
   struct DxvkMetaBlitPipeline {
-    VkDescriptorSetLayout dsetLayout;
-    VkPipelineLayout      pipeLayout;
-    VkPipeline            pipeHandle;
+    const DxvkPipelineLayout* layout    = nullptr;
+    VkPipeline                pipeline  = VK_NULL_HANDLE;;
   };
   
 
@@ -99,7 +94,7 @@ namespace dxvk {
     
   public:
     
-    DxvkMetaBlitObjects(const DxvkDevice* device);
+    DxvkMetaBlitObjects(DxvkDevice* device);
     ~DxvkMetaBlitObjects();
     
     /**
@@ -107,23 +102,23 @@ namespace dxvk {
      * 
      * \param [in] viewType Source image view type
      * \param [in] viewFormat Image view format
-     * \param [in] samples Target sample count
+     * \param [in] srcSamples Source sample count
+     * \param [in] dstSamples Target sample count
+     * \param [in] resolveMode The resolve mode to use
      * \returns The blit pipeline
      */
     DxvkMetaBlitPipeline getPipeline(
             VkImageViewType       viewType,
             VkFormat              viewFormat,
-            VkSampleCountFlagBits samples);
+            VkSampleCountFlagBits srcSamples,
+            VkSampleCountFlagBits dstSamples,
+            DxvkMetaBlitResolveMode resolveMode);
     
   private:
-    
-    Rc<vk::DeviceFn>  m_vkd;
-    
-    VkShaderModule m_shaderVert   = VK_NULL_HANDLE;
-    VkShaderModule m_shaderGeom   = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFrag1D = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFrag2D = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFrag3D = VK_NULL_HANDLE;
+
+    DxvkDevice* m_device = nullptr;
+
+    const DxvkPipelineLayout* m_layout = nullptr;
     
     dxvk::mutex m_mutex;
     
@@ -132,24 +127,11 @@ namespace dxvk {
       DxvkMetaBlitPipeline,
       DxvkHash, DxvkEq> m_pipelines;
     
-    VkShaderModule createShaderModule(
-      const SpirvCodeBuffer&            code) const;
+    const DxvkPipelineLayout* createPipelineLayout() const;
     
     DxvkMetaBlitPipeline createPipeline(
-      const DxvkMetaBlitPipelineKey&    key);
-    
-    VkDescriptorSetLayout createDescriptorSetLayout(
-            VkImageViewType             viewType) const;
-    
-    VkPipelineLayout createPipelineLayout(
-            VkDescriptorSetLayout       descriptorSetLayout) const;
-    
-    VkPipeline createPipeline(
-            VkPipelineLayout            pipelineLayout,
-            VkImageViewType             imageViewType,
-            VkFormat                    format,
-            VkSampleCountFlagBits       samples) const;
-    
+      const DxvkMetaBlitPipelineKey& key) const;
+
   };
   
 }

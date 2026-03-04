@@ -668,29 +668,29 @@ namespace dxvk {
     // works, provided the shader does not have any actual inputs
     if (!pInputElementDescs)
       return E_INVALIDARG;
-    
+
     try {
       DxbcReader dxbcReader(reinterpret_cast<const char*>(
         pShaderBytecodeWithInputSignature), BytecodeLength);
       DxbcModule dxbcModule(dxbcReader);
-      
+
       const Rc<DxbcIsgn> inputSignature = dxbcModule.isgn();
 
       uint32_t attrMask = 0;
       uint32_t bindMask = 0;
       uint32_t locationMask = 0;
       uint32_t bindingsDefined = 0;
-      
+
       std::array<DxvkVertexAttribute, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> attrList = { };
       std::array<DxvkVertexBinding,   D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> bindList = { };
-      
+
       for (uint32_t i = 0; i < NumElements; i++) {
         const DxbcSgnEntry* entry = inputSignature->find(
           pInputElementDescs[i].SemanticName,
           pInputElementDescs[i].SemanticIndex, 0);
 
         // Create vertex input attribute description
-        DxvkVertexAttribute attrib;
+        DxvkVertexAttribute attrib = { };
         attrib.location = entry != nullptr ? entry->registerId : 0;
         attrib.binding  = pInputElementDescs[i].InputSlot;
         attrib.format   = LookupFormat(pInputElementDescs[i].Format, DXGI_VK_FORMAT_MODE_COLOR).Format;
@@ -714,17 +714,18 @@ namespace dxvk {
               break;
             }
           }
-        } else if (attrib.offset & (alignment - 1))
+        } else if (attrib.offset & (alignment - 1)) {
           return E_INVALIDARG;
+        }
 
         attrList.at(i) = attrib;
 
         // Create vertex input binding description. The
         // stride is dynamic state in D3D11 and will be
         // set by D3D11DeviceContext::IASetVertexBuffers.
-        DxvkVertexBinding binding;
+        DxvkVertexBinding binding = { };
         binding.binding   = pInputElementDescs[i].InputSlot;
-        binding.fetchRate = pInputElementDescs[i].InstanceDataStepRate;
+        binding.divisor   = pInputElementDescs[i].InstanceDataStepRate;
         binding.inputRate = pInputElementDescs[i].InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA
           ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
         binding.extent    = entry ? uint32_t(attrib.offset + formatInfo->elementSize) : 0u;
@@ -1898,12 +1899,6 @@ namespace dxvk {
   D3D_FEATURE_LEVEL D3D11Device::GetMaxFeatureLevel(
     const Rc<DxvkInstance>& Instance,
     const Rc<DxvkAdapter>&  Adapter) {
-    // Check whether baseline features are supported by the device    
-    DxvkDeviceFeatures features = GetDeviceFeatures(Adapter);
-    
-    if (!Adapter->checkFeatureSupport(features))
-      return D3D_FEATURE_LEVEL();
-
     // The feature level override always takes precedence
     static const std::array<std::pair<std::string, D3D_FEATURE_LEVEL>, 9> s_featureLevels = {{
       { "12_1", D3D_FEATURE_LEVEL_12_1 },
@@ -1929,84 +1924,6 @@ namespace dxvk {
 
     // Otherwise, check the actually available device features
     return D3D11DeviceFeatures::GetMaxFeatureLevel(Instance, Adapter);
-  }
-  
-  
-  DxvkDeviceFeatures D3D11Device::GetDeviceFeatures(
-    const Rc<DxvkAdapter>&  Adapter) {
-    DxvkDeviceFeatures supported = Adapter->features();
-    DxvkDeviceFeatures enabled   = {};
-
-    // Required for feature level 10_1
-    enabled.core.features.depthBiasClamp                          = VK_TRUE;
-    enabled.core.features.depthClamp                              = VK_TRUE;
-    enabled.core.features.dualSrcBlend                            = VK_TRUE;
-    enabled.core.features.fillModeNonSolid                        = VK_TRUE;
-    enabled.core.features.fullDrawIndexUint32                     = VK_TRUE;
-    enabled.core.features.geometryShader                          = VK_TRUE;
-    enabled.core.features.imageCubeArray                          = VK_TRUE;
-    enabled.core.features.independentBlend                        = VK_TRUE;
-    enabled.core.features.multiViewport                           = VK_TRUE;
-    enabled.core.features.occlusionQueryPrecise                   = VK_TRUE;
-    enabled.core.features.pipelineStatisticsQuery                 = supported.core.features.pipelineStatisticsQuery;
-    enabled.core.features.sampleRateShading                       = VK_TRUE;
-    enabled.core.features.samplerAnisotropy                       = supported.core.features.samplerAnisotropy;
-    enabled.core.features.shaderClipDistance                      = VK_TRUE;
-    enabled.core.features.shaderCullDistance                      = VK_TRUE;
-    enabled.core.features.shaderImageGatherExtended               = VK_TRUE;
-    enabled.core.features.textureCompressionBC                    = VK_TRUE;
-
-    enabled.vk12.samplerMirrorClampToEdge                         = VK_TRUE;
-
-    enabled.vk13.shaderDemoteToHelperInvocation                   = VK_TRUE;
-
-    enabled.extCustomBorderColor.customBorderColors               = supported.extCustomBorderColor.customBorderColorWithoutFormat;
-    enabled.extCustomBorderColor.customBorderColorWithoutFormat   = supported.extCustomBorderColor.customBorderColorWithoutFormat;
-
-    enabled.extTransformFeedback.transformFeedback                = VK_TRUE;
-    enabled.extTransformFeedback.geometryStreams                  = VK_TRUE;
-
-    enabled.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor      = supported.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor;
-    enabled.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor  = supported.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor;
-
-    // Required for Feature Level 11_0
-    enabled.core.features.drawIndirectFirstInstance               = supported.core.features.drawIndirectFirstInstance;
-    enabled.core.features.fragmentStoresAndAtomics                = supported.core.features.fragmentStoresAndAtomics;
-    enabled.core.features.tessellationShader                      = supported.core.features.tessellationShader;
-
-    // Required for Feature Level 11_1
-    enabled.core.features.logicOp                                 = supported.core.features.logicOp;
-    enabled.core.features.vertexPipelineStoresAndAtomics          = supported.core.features.vertexPipelineStoresAndAtomics;
-
-    // Required for Feature Level 12_0
-    enabled.core.features.sparseBinding                           = supported.core.features.sparseBinding;
-    enabled.core.features.sparseResidencyBuffer                   = supported.core.features.sparseResidencyBuffer;
-    enabled.core.features.sparseResidencyImage2D                  = supported.core.features.sparseResidencyImage2D;
-    enabled.core.features.sparseResidencyImage3D                  = supported.core.features.sparseResidencyImage3D;
-    enabled.core.features.sparseResidency2Samples                 = supported.core.features.sparseResidency2Samples;
-    enabled.core.features.sparseResidency4Samples                 = supported.core.features.sparseResidency4Samples;
-    enabled.core.features.sparseResidency8Samples                 = supported.core.features.sparseResidency8Samples;
-    enabled.core.features.sparseResidency16Samples                = supported.core.features.sparseResidency16Samples;
-    enabled.core.features.sparseResidencyAliased                  = supported.core.features.sparseResidencyAliased;
-    enabled.core.features.shaderResourceResidency                 = supported.core.features.shaderResourceResidency;
-    enabled.core.features.shaderResourceMinLod                    = supported.core.features.shaderResourceMinLod;
-    enabled.vk12.samplerFilterMinmax                              = supported.vk12.samplerFilterMinmax;
-
-    // Required for Feature Level 12_1
-    enabled.extFragmentShaderInterlock.fragmentShaderSampleInterlock = supported.extFragmentShaderInterlock.fragmentShaderSampleInterlock;
-    enabled.extFragmentShaderInterlock.fragmentShaderPixelInterlock  = supported.extFragmentShaderInterlock.fragmentShaderPixelInterlock;
-
-    // Optional in any feature level
-    enabled.core.features.depthBounds                             = supported.core.features.depthBounds;
-    enabled.core.features.shaderFloat64                           = supported.core.features.shaderFloat64;
-    enabled.core.features.shaderInt64                             = supported.core.features.shaderInt64;
-
-    // Depth bias control
-    enabled.extDepthBiasControl.depthBiasControl                                = supported.extDepthBiasControl.depthBiasControl;
-    enabled.extDepthBiasControl.depthBiasExact                                  = supported.extDepthBiasControl.depthBiasExact;
-    enabled.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation = supported.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation;
-
-    return enabled;
   }
   
   
@@ -2465,6 +2382,38 @@ namespace dxvk {
   }
 
 
+  bool D3D11Device::LockImage(
+    const Rc<DxvkImage>&            Image,
+          VkImageUsageFlags         Usage) {
+    bool feedback = false;
+
+    auto chunk = AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+    chunk->push([
+      cImage  = Image,
+      cUsage  = Usage,
+      &feedback
+    ] (DxvkContext* ctx) {
+      DxvkImageUsageInfo usageInfo;
+      usageInfo.usage = cUsage;
+      usageInfo.stableGpuAddress = VK_TRUE;
+
+      feedback = ctx->ensureImageCompatibility(cImage, usageInfo);
+    });
+
+    m_context->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), true);
+
+    if (!feedback) {
+      Logger::err(str::format("Failed to lock image:"
+        "\n  Image format:  ", Image->info().format,
+        "\n  Image usage:   ", std::hex, Image->info().usage,
+        "\n  Desired usage: ", std::hex, Usage));
+    }
+
+    return feedback;
+  }
+
+
 
   D3D11DeviceExt::D3D11DeviceExt(
           D3D11DXGIDevice*        pContainer,
@@ -2513,8 +2462,7 @@ namespace dxvk {
         return deviceFeatures.nvxImageViewHandle;
 
       case D3D11_VK_NVX_BINARY_IMPORT:
-        return deviceFeatures.nvxBinaryImport
-            && deviceFeatures.vk12.bufferDeviceAddress;
+        return deviceFeatures.nvxBinaryImport;
 
       default:
         return false;
@@ -2547,7 +2495,7 @@ namespace dxvk {
 
     VkImageViewHandleInfoNVX imageViewHandleInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX };
     imageViewHandleInfo.imageView = pIV->handle();
-    imageViewHandleInfo.sampler = pDSS->handle();
+    imageViewHandleInfo.sampler = pDSS->getDescriptor().samplerObject;
     imageViewHandleInfo.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 
     // note: there's no implicit lifetime management here; it's up to the
@@ -2654,7 +2602,7 @@ namespace dxvk {
       Rc<DxvkBuffer> dxvkBuffer = GetCommonBuffer(pResource)->GetBuffer();
       LockBuffer(dxvkBuffer);
 
-      *gpuVAStart = dxvkBuffer->gpuAddress();
+      *gpuVAStart = dxvkBuffer->getSliceInfo().gpuAddress;
       *gpuVASize = dxvkBuffer->info().size;
     } else {
       Logger::warn(str::format("GetResourceHandleGPUVirtualAddressAndSize(): Unsupported resource type: ", resourceDesc.Dim));
@@ -2812,32 +2760,7 @@ namespace dxvk {
     if (!Image->canRelocate() && (Image->info().usage & Usage))
       return true;
 
-    bool feedback = false;
-
-    auto chunk = m_device->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
-
-    chunk->push([
-      cImage  = Image,
-      cUsage  = Usage,
-      &feedback
-    ] (DxvkContext* ctx) {
-      DxvkImageUsageInfo usageInfo;
-      usageInfo.usage = cUsage;
-      usageInfo.stableGpuAddress = VK_TRUE;
-
-      feedback = ctx->ensureImageCompatibility(cImage, usageInfo);
-    });
-
-    m_device->GetContext()->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), true);
-
-    if (!feedback) {
-      Logger::err(str::format("Failed to lock image:"
-        "\n  Image format:  ", Image->info().format,
-        "\n  Image usage:   ", std::hex, Image->info().usage,
-        "\n  Desired usage: ", std::hex, Usage));
-    }
-
-    return feedback;
+    return m_device->LockImage(Image, Usage);
   }
 
 
@@ -2892,7 +2815,11 @@ namespace dxvk {
     const D3D11_VIDEO_DECODER_DESC*                     pVideoDesc,
     const D3D11_VIDEO_DECODER_CONFIG*                   pConfig,
           ID3D11VideoDecoder**                          ppDecoder) {
-    Logger::err("D3D11VideoDevice::CreateVideoDecoder: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CreateVideoDecoder: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -2915,7 +2842,7 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::CreateAuthenticatedChannel(
           D3D11_AUTHENTICATED_CHANNEL_TYPE              ChannelType,
           ID3D11AuthenticatedChannel**                  ppAuthenticatedChannel) {
-    Logger::err("D3D11VideoDevice::CreateAuthenticatedChannel: Stub");
+    Logger::warn("D3D11VideoDevice::CreateAuthenticatedChannel: Stub");
     return E_NOTIMPL;
   }
 
@@ -2925,7 +2852,7 @@ namespace dxvk {
     const GUID*                                         pDecoderProfile,
     const GUID*                                         pKeyExchangeType,
           ID3D11CryptoSession**                         ppCryptoSession) {
-    Logger::err("D3D11VideoDevice::CreateCryptoSession: Stub");
+    Logger::warn("D3D11VideoDevice::CreateCryptoSession: Stub");
     return E_NOTIMPL;
   }
 
@@ -2934,7 +2861,11 @@ namespace dxvk {
           ID3D11Resource*                               pResource,
     const D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC*         pDesc,
           ID3D11VideoDecoderOutputView**                ppVDOVView) {
-    Logger::err("D3D11VideoDevice::CreateVideoDecoderOutputView: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CreateVideoDecoderOutputView: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -2983,7 +2914,11 @@ namespace dxvk {
 
 
   UINT STDMETHODCALLTYPE D3D11VideoDevice::GetVideoDecoderProfileCount() {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderProfileCount: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderProfileCount: Stub");
+
     return 0;
   }
 
@@ -2991,7 +2926,11 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::GetVideoDecoderProfile(
           UINT                                          Index,
           GUID*                                         pDecoderProfile) {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderProfile: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderProfile: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3000,7 +2939,11 @@ namespace dxvk {
     const GUID*                                         pDecoderProfile,
           DXGI_FORMAT                                   Format,
           BOOL*                                         pSupported) {
-    Logger::err("D3D11VideoDevice::CheckVideoDecoderFormat: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CheckVideoDecoderFormat: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3008,8 +2951,17 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::GetVideoDecoderConfigCount(
     const D3D11_VIDEO_DECODER_DESC*                     pDesc,
           UINT*                                         pCount) {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderConfigCount: Stub");
-    return E_NOTIMPL;
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderConfigCount: Stub");
+
+    if (!pCount)
+      return E_INVALIDARG;
+
+    *pCount = 0;
+
+    return S_OK;
   }
 
 
@@ -3017,7 +2969,11 @@ namespace dxvk {
     const D3D11_VIDEO_DECODER_DESC*                     pDesc,
           UINT                                          Index,
           D3D11_VIDEO_DECODER_CONFIG*                   pConfig) {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderConfig: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderConfig: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3026,7 +2982,11 @@ namespace dxvk {
     const GUID*                                         pCryptoType,
     const GUID*                                         pDecoderProfile,
           D3D11_VIDEO_CONTENT_PROTECTION_CAPS*          pCaps) {
-    Logger::err("D3D11VideoDevice::GetContentProtectionCaps: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetContentProtectionCaps: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3036,7 +2996,11 @@ namespace dxvk {
     const GUID*                                         pDecoderProfile,
           UINT                                          Index,
           GUID*                                         pKeyExchangeType) {
-    Logger::err("D3D11VideoDevice::CheckCryptoKeyExchange: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CheckCryptoKeyExchange: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3054,8 +3018,6 @@ namespace dxvk {
     const IUnknown*                                     pData) {
     return m_container->SetPrivateDataInterface(Name, pData);
   }
-
-
 
 
   D3D11ReflexDevice::D3D11ReflexDevice(
@@ -3354,7 +3316,8 @@ namespace dxvk {
     m_d3d11Reflex   (this, &m_d3d11Device),
     m_d3d11on12     (this, &m_d3d11Device, pD3D12Device, pD3D12Queue),
     m_metaDevice    (this),
-    m_dxvkFactory   (this, &m_d3d11Device) {
+    m_dxvkFactory   (this, &m_d3d11Device),
+    m_destructionNotifier(this) {
 
   }
   
@@ -3441,6 +3404,11 @@ namespace dxvk {
       Com<ID3D11DeviceContext> context;
       m_d3d11Device.GetImmediateContext(&context);
       return context->QueryInterface(riid, ppvObject);
+    }
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
     }
 
     if (riid == __uuidof(ID3D11Debug))

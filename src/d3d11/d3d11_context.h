@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
 #include <vector>
 
@@ -75,7 +76,6 @@ namespace dxvk {
     // Use a local staging buffer to handle tiny uploads, most
     // of the time we're fine with hitting the global allocator
     constexpr static VkDeviceSize StagingBufferSize = 256ull << 10;
-
   protected:
     // Compile-time debug flag to force lazy binding on (True) or off (False)
     constexpr static Tristate DebugLazyBinding = Tristate::Auto;
@@ -919,10 +919,26 @@ namespace dxvk {
             UINT                              Slot,
             D3D11UnorderedAccessView*         pUav);
 
+    void ClearImageView(
+            Rc<DxvkImageView>                 View,
+      const FLOAT                             Color[4],
+      const D3D11_RECT*                       pRects,
+            UINT                              NumRects);
+
+    void ClearBufferView(
+            Rc<DxvkBufferView>                View,
+      const FLOAT                             Color[4],
+      const D3D11_RECT*                       pRects,
+            UINT                              NumRects);
+
     VkClearValue ConvertColorValue(
       const FLOAT                             Color[4],
       const DxvkFormatInfo*                   pFormatInfo);
-    
+
+    VkRect2D ConvertRect(
+            D3D11_RECT                        Rect,
+            VkExtent2D                        Extent);
+
     void CopyBuffer(
             D3D11Buffer*                      pDstBuffer,
             VkDeviceSize                      DstOffset,
@@ -1091,6 +1107,12 @@ namespace dxvk {
             ID3D11Buffer*                     pBufferForArgs,
             ID3D11Buffer*                     pBufferForCount);
 
+    void SyncImage(
+      const Rc<DxvkImage>&                    DstImage,
+      const VkImageSubresourceLayers&         DstLayers,
+      const Rc<DxvkImage>&                    SrcImage,
+      const VkImageSubresourceLayers&         SrcLayers);
+
     bool TestRtvUavHazards(
             UINT                              NumRTVs,
             ID3D11RenderTargetView* const*    ppRTVs,
@@ -1143,20 +1165,18 @@ namespace dxvk {
             ID3D11RenderTargetView* const*    ppRenderTargetViews,
             ID3D11DepthStencilView*           pDepthStencilView);
 
-    static void InitDefaultPrimitiveTopology(
-            DxvkInputAssemblyState*           pIaState);
+    static DxvkInputAssemblyState InitDefaultPrimitiveTopology();
 
-    static void InitDefaultRasterizerState(
-            DxvkRasterizerState*              pRsState);
+    static DxvkRasterizerState InitDefaultRasterizerState();
 
-    static void InitDefaultDepthStencilState(
-            DxvkDepthStencilState*            pDsState);
+    static DxvkDepthStencilState InitDefaultDepthStencilState();
 
-    static void InitDefaultBlendState(
-            DxvkBlendMode*                    pCbState,
-            DxvkLogicOpState*                 pLoState,
-            DxvkMultisampleState*             pMsState,
+    static DxvkMultisampleState InitDefaultMultisampleState(
             UINT                              SampleMask);
+
+    static DxvkLogicOpState InitDefaultLogicOpState();
+
+    static DxvkBlendMode InitDefaultBlendState();
 
     template<bool AllowFlush = true, typename Cmd>
     void EmitCs(Cmd&& command) {

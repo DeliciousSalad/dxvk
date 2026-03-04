@@ -203,6 +203,14 @@ namespace dxvk {
     }
 
     /**
+     * \brief Cube
+     * \returns Whether the texture is a cube map
+     */
+    bool IsCube() const {
+      return m_type == D3DRTYPE_CUBETEXTURE;
+    }
+
+    /**
      * \brief Dref Clamp
      * \returns Whether the texture emulates an UNORM format with D32f
      */
@@ -319,6 +327,10 @@ namespace dxvk {
       return std::exchange(m_transitionedToHazardLayout, true);
     }
 
+    bool HasBeenTransitionedToHazardLayout() const {
+      return m_transitionedToHazardLayout;
+    }
+
     D3DRESOURCETYPE GetType() const {
       return m_type;
     }
@@ -345,33 +357,11 @@ namespace dxvk {
       return m_sampleView.Pick(srgb && IsSrgbCompatible());
     }
 
-    VkImageLayout DetermineRenderTargetLayout(VkImageLayout hazardLayout) const {
-      if (unlikely(m_transitionedToHazardLayout))
-        return hazardLayout;
-
-      return m_image != nullptr &&
-             m_image->info().tiling == VK_IMAGE_TILING_OPTIMAL
-        ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-        : VK_IMAGE_LAYOUT_GENERAL;
-    }
-
-    VkImageLayout DetermineDepthStencilLayout(bool write, bool hazardous, VkImageLayout hazardLayout) const {
-      if (unlikely(m_transitionedToHazardLayout))
-        return hazardLayout;
-
-      if (unlikely(m_image->info().tiling != VK_IMAGE_TILING_OPTIMAL))
-        return VK_IMAGE_LAYOUT_GENERAL;
-
-      if (unlikely(hazardous && !write))
-        return VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL;
-
-      return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    }
-
     Rc<DxvkImageView> CreateView(
             UINT                   Layer,
             UINT                   Lod,
-            VkImageUsageFlags      UsageFlags,
+            VkImageUsageFlagBits   UsageFlags,
+            VkImageLayout          Layout,
             bool                   Srgb);
     D3D9SubresourceBitset& GetUploadBitmask() { return m_needsUpload; }
 
@@ -540,7 +530,7 @@ namespace dxvk {
 
     D3D9VkInteropTexture          m_d3d9Interop;
 
-    Rc<DxvkImage> CreatePrimaryImage(D3DRESOURCETYPE ResourceType, bool TryOffscreenRT, HANDLE* pSharedHandle) const;
+    Rc<DxvkImage> CreatePrimaryImage(D3DRESOURCETYPE ResourceType, HANDLE* pSharedHandle) const;
 
     Rc<DxvkImage> CreateResolveImage() const;
 
