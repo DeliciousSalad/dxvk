@@ -7015,8 +7015,8 @@ namespace dxvk {
     state.viewport = VkViewport{
       float(vp.X)     + cf,    float(vp.Height + vp.Y) + cf,
       float(vp.Width),        -float(vp.Height),
-      std::clamp(vp.MinZ,                            0.0f, 1.0f),
-      std::clamp(std::max(vp.MaxZ, vp.MinZ + zBias), 0.0f, 1.0f),
+      vp.MinZ,
+      std::max(vp.MaxZ, vp.MinZ + zBias),
     };
 
     // Scissor rectangles. Vulkan does not provide an easy way
