@@ -682,23 +682,13 @@ bool OpenXRDirectMode::EndFrame()
 		}
 	}
 
-	// Get the current view poses
-	XrViewLocateInfo viewLocateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-	viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	viewLocateInfo.displayTime = m_frameState.predictedDisplayTime;
-	viewLocateInfo.space = m_referenceSpace;
+	// Use the view poses captured during WaitGetPoses() — these match what the game
+	// actually rendered. Re-querying xrLocateViews here would return a refined pose
+	// (the runtime accumulates sensor data over the render period), causing the
+	// projectionView.pose to disagree with the rendered image and producing incorrect
+	// reprojection (visible as a 1-frame lag when shaking the head quickly).
+	XrResult result;
 
-	uint32_t viewCount = (uint32_t)m_views.size();
-	XrResult result = xrLocateViews(m_session, &viewLocateInfo, &m_viewState, viewCount, &viewCount, m_views.data());
-
-	if (XR_FAILED(result)) 
-	{
-		Logger::err(str::format("OpenXRDirectMode: xrLocateViews failed with error code: ", (int)result));
-		m_bFrameStarted = false;
-		return false;
-	}
-	
-	// Only use the views if they're valid, otherwise use default values
 	bool validViews = (m_viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
 					 (m_viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
 	
